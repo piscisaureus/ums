@@ -1,0 +1,9 @@
+{
+    "C_Cpp.workspaceSymbols": "All",
+    "C_Cpp.default.intelliSenseMode": "msvc-x64",
+    "rust-analyzer.inlayHints.chainingHints": false,
+    "rust-analyzer.lruCapacity": 99999999,
+    "rust-analyzer.cargo.features": [
+        "winapi/everything"
+    ]
+}
