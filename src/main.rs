@@ -1,4 +1,9 @@
+use derive_deref::*;
 use scopeguard::guard;
+
+use std::cell::RefCell;
+use std::cell::RefMut;
+use std::collections::VecDeque;
 use std::io;
 use std::iter::repeat;
 use std::mem::align_of;
@@ -8,10 +13,8 @@ use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::minwindef::{FALSE, TRUE};
 
-use winapi::shared::winerror::*;
-use winapi::um::errhandlingapi::*;
-use winapi::um::handleapi::CloseHandle;
 use winapi::um::processthreadsapi::*;
+use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
 
@@ -22,14 +25,26 @@ const UMS_VERSION: DWORD = RTL_UMS_VERSION;
 const PROC_THREAD_ATTRIBUTE_UMS_THREAD: DWORD_PTR =
   6 | 0x0001_0000 | 0x0002_0000;
 
+const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD =
+0x0001_0000;
+
 fn main() {
-  //let ums_completion_list = create_ums_completion_list().unwrap();
-  //let _ = create_ums_thread(ums_completion_list);
+  unsafe { Sleep(1000) };
   run_ums_scheduler().unwrap()
 }
 
+static STATE: StaticState = StaticState(RefCell::new(None));
+
+#[derive(Deref, DerefMut)]
+struct StaticState(RefCell<Option<UmsSchedulerState>>);
+
+unsafe impl Send for StaticState {}
+unsafe impl Sync for StaticState {}
+
 struct UmsSchedulerState {
   pub completion_list: PUMS_COMPLETION_LIST,
+  pub main_thread: PUMS_CONTEXT,
+  pub ready_threads: VecDeque<PUMS_CONTEXT>,
 }
 
 unsafe impl Send for UmsSchedulerState {}
@@ -37,60 +52,87 @@ unsafe impl Sync for UmsSchedulerState {}
 
 impl UmsSchedulerState {
   pub fn new(completion_list: PUMS_COMPLETION_LIST) -> Self {
-    Self { completion_list }
+    Self {
+      completion_list,
+      main_thread: null_mut(),
+      ready_threads: VecDeque::new(),
+    }
   }
 
-  pub fn as_void_ptr(&mut self) -> *mut VOID {
-    cast_mut_void(self)
+  pub fn init<'a>(completion_list: PUMS_COMPLETION_LIST) {
+    let state = Self::new(completion_list);
+    let mut ref_mut = STATE.borrow_mut();
+    let prev = ref_mut.replace(state);
+    assert!(prev.is_none());
   }
 
-  pub unsafe fn from_void_ptr<'a>(p: *mut VOID) -> &'a mut Self {
-    &mut *cast_aligned(p)
+  pub fn get<'a>() -> RefMut<'a, Self> {
+    let ref_mut = STATE.borrow_mut();
+    RefMut::map(ref_mut, |r| r.as_mut().unwrap())
   }
 }
 
-unsafe extern "system" fn ums_scheduler(
+extern "system" fn ums_scheduler(
   reason: UMS_SCHEDULER_REASON,
   activation_payload: ULONG_PTR,
   scheduler_param: *mut VOID,
 ) {
-  return;
-  let ums_thread_context =
-    ums_scheduler_impl(reason, activation_payload, scheduler_param).unwrap();
-  loop {
-    let ok = ExecuteUmsThread(ums_thread_context);
-    assert!(ok == FALSE);
-    let error = GetLastError();
-    if error != ERROR_RETRY {
-      Err(io::Error::from_raw_os_error(error as i32)).unwrap()
+  unsafe {
+    eprintln!(
+      "S: {:?} {:?} {:?}",
+      reason, activation_payload, scheduler_param
+    );
+
+    if reason == 0 {
+      eprintln!("n");
+      let mut state = UmsSchedulerState::get();
+      let _main_thread = create_ums_thread(state.completion_list).unwrap();
+      let _main_thread = create_ums_thread(state.completion_list).unwrap();
+      let main_thread = create_ums_thread(state.completion_list).unwrap();
+      state.main_thread = main_thread;
+    }
+
+    loop {
+      loop {
+        eprintln!("l");
+        let t = {
+          let mut state = UmsSchedulerState::get();
+          state.ready_threads.pop_front()
+        };
+        match t {
+          Some(t) => {
+            println!("x PCTX: {:X?}", t);
+            let ok = ExecuteUmsThread(t);
+            eprintln!("ERR");
+            bool_to_result(ok).unwrap();
+          },
+          None => break,
+        }
+      }
+
+      {
+        eprintln!("w");
+        let mut state = UmsSchedulerState::get();
+        let mut thread_list: PUMS_CONTEXT = null_mut();
+        let ok = DequeueUmsCompletionListItems(
+          state.completion_list,
+          INFINITE,
+          &mut thread_list,
+        );
+        bool_to_result(ok).unwrap();
+        while !(thread_list.is_null()) {
+          eprintln!("w<r");
+          state.ready_threads.push_back(thread_list);
+          thread_list = GetNextUmsListItem(thread_list);
+        }
+      }
     }
   }
 }
 
-fn ums_scheduler_impl(
-  reason: UMS_SCHEDULER_REASON,
-  _activation_payload: ULONG_PTR,
-  scheduler_param: *mut VOID,
-) -> io::Result<PUMS_CONTEXT> {
-  // On startup, store the UmsSchedulerState reference that we received in
-  // `scheduler_param`. On subsequent invocations, read it out of this slot,
-  let state = unsafe {
-    static mut STATE: Option<&'static mut UmsSchedulerState> = None;
-    if reason == UmsSchedulerStartup {
-      let prev =
-        STATE.replace(UmsSchedulerState::from_void_ptr(scheduler_param));
-      assert!(prev.is_none());
-    }
-    STATE.as_mut().unwrap()
-  };
-
-  let thread_context = create_ums_thread(state.completion_list)?;
-  Ok(thread_context)
-}
-
 fn run_ums_scheduler() -> io::Result<()> {
   unsafe {
-    let mut completion_list = null_mut();
+    let mut completion_list: PUMS_COMPLETION_LIST = null_mut();
     let ok = CreateUmsCompletionList(&mut completion_list);
     bool_to_result(ok)?;
     assert!(!completion_list.is_null());
@@ -99,12 +141,14 @@ fn run_ums_scheduler() -> io::Result<()> {
       assert_eq!(ok, TRUE);
     });
 
-    let mut scheduler_state = UmsSchedulerState::new(completion_list);
+    UmsSchedulerState::init(completion_list);
+    assert_eq!(UmsSchedulerState::get().completion_list, completion_list);
+
     let mut scheduler_startup_info = UMS_SCHEDULER_STARTUP_INFO {
       UmsVersion: UMS_VERSION,
       CompletionList: completion_list,
       SchedulerProc: Some(ums_scheduler),
-      SchedulerParam: scheduler_state.as_void_ptr(),
+      SchedulerParam: null_mut(),
     };
     let ok = EnterUmsSchedulingMode(&mut scheduler_startup_info);
     bool_to_result(ok)?;
@@ -113,16 +157,11 @@ fn run_ums_scheduler() -> io::Result<()> {
   }
 }
 
-fn bool_to_result(ok: BOOL) -> io::Result<()> {
-  match ok {
-    TRUE => Ok(()),
-    FALSE => Err(io::Error::last_os_error())?,
-    _ => unreachable!(),
-  }
-}
-
 unsafe extern "system" fn thread_main(_param: LPVOID) -> DWORD {
-  eprintln!("In da thread!!");
+  for _ in 0..10 {
+    eprintln!("In da thread!!");
+    Sleep(1000);
+  }
   123
 }
 
@@ -172,24 +211,35 @@ fn create_ums_thread(
     );
     assert_eq!(ok, TRUE);
 
+    let mut thread_id: DWORD = 0;
     let thread_handle = CreateRemoteThreadEx(
       GetCurrentProcess(),
       null_mut(),
-      0,
+      1 << 20,
       Some(thread_main),
       null_mut(),
-      0,
+      STACK_SIZE_PARAM_IS_A_RESERVATION,
       attr_list_ptr,
-      null_mut(),
+      &mut thread_id,
     );
     if thread_handle.is_null() {
       Err(io::Error::last_os_error())?;
     }
 
-    let ok = CloseHandle(thread_handle);
-    bool_to_result(ok)?;
+    eprintln!("tid: {}  UCTX: {:X?}", thread_id, ums_context);
+
+    //let ok = CloseHandle(thread_handle);
+    //bool_to_result(ok)?;
 
     Ok(ums_context)
+  }
+}
+
+fn bool_to_result(ok: BOOL) -> io::Result<()> {
+  match ok {
+    TRUE => Ok(()),
+    FALSE => Err(io::Error::last_os_error())?,
+    _ => unreachable!(),
   }
 }
 
@@ -200,6 +250,7 @@ fn cast_aligned<T, U>(p: *mut T) -> *mut U {
   address as *mut U
 }
 
+#[allow(dead_code)]
 fn cast_mut_void<T>(p: *const T) -> *mut VOID {
   p as *mut T as *mut VOID
 }

@@ -4,5 +4,9 @@
     "rust-analyzer.inlayHints.chainingHints": false,
     "rust-analyzer.cargo.features": [
         "winapi/everything"
-    ]
+    ],
+    "lldb.displayFormat": "auto",
+    "lldb.showDisassembly": "auto",
+    "lldb.dereferencePointers": true,
+    "rust-analyzer.cargo.loadOutDirsFromCheck": true
 }
