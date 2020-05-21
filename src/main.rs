@@ -3,7 +3,7 @@
 
 use derive_deref::*;
 use scopeguard::guard;
-
+use scopeguard::ScopeGuard;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::VecDeque;
@@ -22,19 +22,17 @@ use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
 
-#[allow(non_camel_case_types)]
-type UMS_SCHEDULER_REASON = RTL_UMS_SCHEDULER_REASON;
-const UMS_VERSION: DWORD = RTL_UMS_VERSION;
-
-const PROC_THREAD_ATTRIBUTE_UMS_THREAD: DWORD_PTR =
-  6 | 0x0001_0000 | 0x0002_0000;
-
-const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
-
 fn main() {
   unsafe { Sleep(1000) };
   run_ums_scheduler().unwrap()
 }
+
+#[allow(non_camel_case_types)]
+type UMS_SCHEDULER_REASON = RTL_UMS_SCHEDULER_REASON;
+
+const UMS_VERSION: DWORD = RTL_UMS_VERSION;
+const PROC_THREAD_ATTRIBUTE_UMS_THREAD: DWORD_PTR = 0x0003_0006;
+const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
 
 static STATE: StaticState = StaticState(RefCell::new(None));
 
@@ -143,7 +141,7 @@ extern "system" fn ums_scheduler(
   );
   while let Some(thread_context) = ums_scheduler_impl(cause) {
     let ok = unsafe { ExecuteUmsThread(thread_context) };
-    // ExecuteUmsThread does not return if successful.
+    // If `ExecuteUmsThread()` returns, it has failed.
     assert_eq!(ok, FALSE);
     cause = UmsSchedulerCallCause::from_last_error(thread_context);
   }
@@ -234,9 +232,13 @@ fn create_ums_thread(
   ums_completion_list: PUMS_COMPLETION_LIST,
 ) -> io::Result<PUMS_CONTEXT> {
   unsafe {
-    let mut ums_context = null_mut();
-    let ok = CreateUmsThreadContext(&mut ums_context);
-    assert_eq!(ok, TRUE);
+    let mut thread_context = null_mut();
+    let ok = CreateUmsThreadContext(&mut thread_context);
+    bool_to_result(ok)?;
+    let thread_context_guard = guard(thread_context, |c| {
+      let ok = DeleteUmsThreadContext(c);
+      bool_to_result(ok).unwrap();
+    });
 
     let mut attr_list_size = 0;
     let ok =
@@ -255,13 +257,13 @@ fn create_ums_thread(
       0,
       &mut attr_list_size,
     );
-    assert_eq!(ok, TRUE);
+    bool_to_result(ok)?;
     let _attr_list_guard =
       guard(attr_list_ptr, |p| DeleteProcThreadAttributeList(p));
 
     let attr = UMS_CREATE_THREAD_ATTRIBUTES {
       UmsVersion: UMS_VERSION,
-      UmsContext: ums_context,
+      UmsContext: thread_context,
       UmsCompletionList: ums_completion_list,
     };
 
@@ -274,7 +276,7 @@ fn create_ums_thread(
       null_mut(),
       null_mut(),
     );
-    assert_eq!(ok, TRUE);
+    bool_to_result(ok)?;
 
     let mut thread_id: DWORD = 0;
     let thread_handle = CreateRemoteThreadEx(
@@ -291,12 +293,12 @@ fn create_ums_thread(
       Err(io::Error::last_os_error())?;
     }
 
-    eprintln!("tid: {}  UCTX: {:X?}", thread_id, ums_context);
+    eprintln!("tid: {}  UCTX: {:X?}", thread_id, thread_context);
 
     let ok = CloseHandle(thread_handle);
     bool_to_result(ok)?;
 
-    Ok(ums_context)
+    Ok(ScopeGuard::into_inner(thread_context_guard))
   }
 }
 
