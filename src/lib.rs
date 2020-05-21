@@ -66,35 +66,38 @@ impl UmsSchedulerState {
   }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
+enum ThreadBlockedCause {
+  Trap,
+  SysCall,
+}
+
+#[derive(Debug)]
+enum ThreadReadyCause {
+  Yield { param: *mut VOID },
+  Busy,
+  Suspended,
+  Terminated,
+  ExecuteFailed { error: io::Error },
+}
+
+#[derive(Debug)]
 #[allow(dead_code)] // False positive.
-enum UmsSchedulerCallCause {
+enum SchedulerEntryCause {
   Startup {
     param: *mut VOID,
   },
-  ThreadBlockedOnTrap,
-  ThreadBlockedOnSyscall,
-  ThreadYield {
-    thread_context: *mut UMS_CONTEXT,
-    param: *mut VOID,
+  ThreadBlocked {
+    cause: ThreadBlockedCause,
   },
-  ThreadBusy {
+  ThreadReady {
     thread_context: *mut UMS_CONTEXT,
-  },
-  ThreadSuspended {
-    thread_context: *mut UMS_CONTEXT,
-  },
-  ThreadTerminated {
-    thread_context: *mut UMS_CONTEXT,
-  },
-  ThreadExecuteFailed {
-    thread_context: *mut UMS_CONTEXT,
-    error: DWORD,
+    cause: ThreadReadyCause,
   },
 }
 
-impl UmsSchedulerCallCause {
-  pub fn from_scheduler_args(
+impl SchedulerEntryCause {
+  pub fn from_scheduler_entry_args(
     reason: UMS_SCHEDULER_REASON,
     activation_payload: ULONG_PTR,
     scheduler_param: *mut VOID,
@@ -105,14 +108,20 @@ impl UmsSchedulerCallCause {
         param: scheduler_param,
       },
       UmsSchedulerThreadBlocked if activation_payload == 0 => {
-        Self::ThreadBlockedOnTrap
+        Self::ThreadBlocked {
+          cause: ThreadBlockedCause::Trap,
+        }
       }
       UmsSchedulerThreadBlocked if activation_payload == 1 => {
-        Self::ThreadBlockedOnSyscall
+        Self::ThreadBlocked {
+          cause: ThreadBlockedCause::SysCall,
+        }
       }
-      UmsSchedulerThreadYield => Self::ThreadYield {
+      UmsSchedulerThreadYield => Self::ThreadReady {
+        cause: ThreadReadyCause::Yield {
+          param: scheduler_param,
+        },
         thread_context: activation_payload as *mut UMS_CONTEXT,
-        param: scheduler_param,
       },
       _ => unreachable!(),
     }
@@ -122,19 +131,23 @@ impl UmsSchedulerCallCause {
     thread_context: *mut UMS_CONTEXT,
     error: DWORD,
   ) -> Self {
-    match error {
-      ERROR_RETRY => Self::ThreadBusy { thread_context },
+    let cause = match error {
+      ERROR_RETRY => ThreadReadyCause::Busy,
       ERROR_SUCCESS => unreachable!(),
       _ if Self::get_thread_flag(thread_context, UmsThreadIsTerminated) => {
-        Self::ThreadTerminated { thread_context }
+        ThreadReadyCause::Terminated
       }
       _ if Self::get_thread_flag(thread_context, UmsThreadIsSuspended) => {
-        Self::ThreadSuspended { thread_context }
+        ThreadReadyCause::Suspended
       }
-      error => Self::ThreadExecuteFailed {
-        thread_context,
-        error,
-      },
+      error => {
+        let error = io::Error::from_raw_os_error(error as i32);
+        ThreadReadyCause::ExecuteFailed { error }
+      }
+    };
+    Self::ThreadReady {
+      thread_context,
+      cause,
     }
   }
 
@@ -160,34 +173,34 @@ impl UmsSchedulerCallCause {
   }
 }
 
-extern "system" fn ums_scheduler(
+extern "system" fn scheduler_entry(
   reason: UMS_SCHEDULER_REASON,
   activation_payload: ULONG_PTR,
   scheduler_param: *mut VOID,
 ) {
   // The `ExecuteUmsThread()` does not return if succesful, and certainly Rust
   // does not expect that, so we are at risk of skipping Drop handlers.
-  // Therefore most of the "meat and potatoes" lives in `ums_scheduler_impl()`.
+  // Therefore, most of the actual work is done in `scheduler_entry_impl()`.
   // We just have to be sure that no variables in this function require cleanup.
-  let mut cause = UmsSchedulerCallCause::from_scheduler_args(
+  let mut cause = SchedulerEntryCause::from_scheduler_entry_args(
     reason,
     activation_payload,
     scheduler_param,
   );
-  while let Some(thread_context) = ums_scheduler_impl(cause) {
+  while let Some(thread_context) = scheduler_entry_impl(cause) {
     // `ExecuteUmsThread()` does not return unless it fails.
     let error = unsafe { ExecuteUmsThread(thread_context) }.unwrap_err();
-    cause = UmsSchedulerCallCause::from_execute_error(thread_context, error);
+    cause = SchedulerEntryCause::from_execute_error(thread_context, error);
   }
 }
 
-fn ums_scheduler_impl(
-  cause: UmsSchedulerCallCause,
+fn scheduler_entry_impl(
+  cause: SchedulerEntryCause,
 ) -> Option<*mut UMS_CONTEXT> {
   eprintln!("S: {:?}", cause);
   let mut state = UmsSchedulerState::get();
 
-  use UmsSchedulerCallCause::*;
+  use SchedulerEntryCause::*;
   match cause {
     Startup { .. } => {
       for _ in 0..4 {
@@ -195,22 +208,23 @@ fn ums_scheduler_impl(
         state.thread_count += 1;
       }
     }
-    ThreadTerminated { thread_context } => {
+    ThreadReady {
+      thread_context,
+      cause: ThreadReadyCause::Terminated,
+    } => {
       unsafe { DeleteUmsThreadContext(thread_context) }.unwrap();
       state.thread_count -= 1;
       if state.thread_count == 0 {
         return None;
       }
     }
-    ThreadYield { thread_context, .. }
-    | ThreadBusy { thread_context }
-    | ThreadSuspended { thread_context } => {
-      state.runnable_threads.push_back(thread_context);
-    }
-    ThreadExecuteFailed {
+    ThreadReady {
       thread_context,
-      error,
+      cause: ThreadReadyCause::ExecuteFailed { error },
     } => panic!("Failed to execute thread {:?}: {}", thread_context, error),
+    ThreadReady { thread_context, .. } => {
+      state.runnable_threads.push_back(thread_context)
+    }
     _ => {}
   };
 
@@ -257,7 +271,7 @@ pub fn run_ums_scheduler() -> io::Result<()> {
     let mut scheduler_startup_info = UMS_SCHEDULER_STARTUP_INFO {
       UmsVersion: UMS_VERSION,
       CompletionList: completion_list,
-      SchedulerProc: Some(ums_scheduler),
+      SchedulerProc: Some(scheduler_entry),
       SchedulerParam: null_mut(),
     };
     EnterUmsSchedulingMode(&mut scheduler_startup_info).result()
@@ -324,8 +338,6 @@ fn create_ums_thread(
     )
     .result()?;
     CloseHandle(thread_handle).result()?;
-
-    eprintln!("UCTX: {:X?}", *thread_context);
 
     Ok(ScopeGuard::into_inner(thread_context))
   }
