@@ -1,12 +1,18 @@
 // I think there's nothing wrong with this pattern, so silence clippy about it.
 #![allow(clippy::try_err)]
 
+mod win_result;
+mod winapi_extra;
+
+use crate::win_result::WinResult;
+use crate::winapi_extra::*;
 use derive_deref::*;
 use scopeguard::guard;
 use scopeguard::ScopeGuard;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::io;
 use std::iter::repeat;
 use std::mem::align_of;
@@ -14,21 +20,12 @@ use std::mem::size_of_val;
 use std::ptr::null_mut;
 use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
-use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::winerror::*;
-use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::handleapi::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
-
-#[allow(non_camel_case_types)]
-type UMS_SCHEDULER_REASON = RTL_UMS_SCHEDULER_REASON;
-
-const UMS_VERSION: DWORD = RTL_UMS_VERSION;
-const PROC_THREAD_ATTRIBUTE_UMS_THREAD: DWORD_PTR = 0x0003_0006;
-const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
 
 static STATE: StaticState = StaticState(RefCell::new(None));
 
@@ -39,8 +36,8 @@ unsafe impl Send for StaticState {}
 unsafe impl Sync for StaticState {}
 
 struct UmsSchedulerState {
-  pub completion_list: PUMS_COMPLETION_LIST,
-  pub runnable_threads: VecDeque<PUMS_CONTEXT>,
+  pub completion_list: *mut UMS_COMPLETION_LIST,
+  pub runnable_threads: VecDeque<*mut UMS_CONTEXT>,
   pub thread_count: usize,
 }
 
@@ -48,7 +45,7 @@ unsafe impl Send for UmsSchedulerState {}
 unsafe impl Sync for UmsSchedulerState {}
 
 impl UmsSchedulerState {
-  pub fn new(completion_list: PUMS_COMPLETION_LIST) -> Self {
+  pub fn new(completion_list: *mut UMS_COMPLETION_LIST) -> Self {
     Self {
       completion_list,
       runnable_threads: VecDeque::new(),
@@ -56,7 +53,7 @@ impl UmsSchedulerState {
     }
   }
 
-  pub fn init(completion_list: PUMS_COMPLETION_LIST) {
+  pub fn init(completion_list: *mut UMS_COMPLETION_LIST) {
     let state = Self::new(completion_list);
     let mut ref_mut = STATE.borrow_mut();
     let prev = ref_mut.replace(state);
@@ -78,20 +75,20 @@ enum UmsSchedulerCallCause {
   ThreadBlockedOnTrap,
   ThreadBlockedOnSyscall,
   ThreadYield {
-    thread_context: PUMS_CONTEXT,
+    thread_context: *mut UMS_CONTEXT,
     param: *mut VOID,
   },
   ThreadBusy {
-    thread_context: PUMS_CONTEXT,
+    thread_context: *mut UMS_CONTEXT,
   },
   ThreadSuspended {
-    thread_context: PUMS_CONTEXT,
+    thread_context: *mut UMS_CONTEXT,
   },
   ThreadTerminated {
-    thread_context: PUMS_CONTEXT,
+    thread_context: *mut UMS_CONTEXT,
   },
-  ThreadExecuteError {
-    thread_context: PUMS_CONTEXT,
+  ThreadExecuteFailed {
+    thread_context: *mut UMS_CONTEXT,
     error: DWORD,
   },
 }
@@ -114,15 +111,18 @@ impl UmsSchedulerCallCause {
         Self::ThreadBlockedOnSyscall
       }
       UmsSchedulerThreadYield => Self::ThreadYield {
-        thread_context: activation_payload as PUMS_CONTEXT,
+        thread_context: activation_payload as *mut UMS_CONTEXT,
         param: scheduler_param,
       },
       _ => unreachable!(),
     }
   }
 
-  pub fn from_execute_failure(thread_context: PUMS_CONTEXT) -> Self {
-    match unsafe { GetLastError() } {
+  pub fn from_execute_error(
+    thread_context: *mut UMS_CONTEXT,
+    error: DWORD,
+  ) -> Self {
+    match error {
       ERROR_RETRY => Self::ThreadBusy { thread_context },
       ERROR_SUCCESS => unreachable!(),
       _ if Self::get_thread_flag(thread_context, UmsThreadIsTerminated) => {
@@ -131,7 +131,7 @@ impl UmsSchedulerCallCause {
       _ if Self::get_thread_flag(thread_context, UmsThreadIsSuspended) => {
         Self::ThreadSuspended { thread_context }
       }
-      error => Self::ThreadExecuteError {
+      error => Self::ThreadExecuteFailed {
         thread_context,
         error,
       },
@@ -139,12 +139,12 @@ impl UmsSchedulerCallCause {
   }
 
   fn get_thread_flag(
-    thread_context: PUMS_CONTEXT,
+    thread_context: *mut UMS_CONTEXT,
     thread_info_class: UMS_THREAD_INFO_CLASS,
   ) -> bool {
     let mut flag: BOOLEAN = 0;
     let mut return_length: ULONG = 0;
-    let ok = unsafe {
+    unsafe {
       QueryUmsThreadInformation(
         thread_context,
         thread_info_class,
@@ -152,15 +152,11 @@ impl UmsSchedulerCallCause {
         size_of_val(&flag) as ULONG,
         &mut return_length,
       )
-    };
-    match ok {
-      TRUE => {
-        assert_eq!(return_length as usize, size_of_val(&flag));
-        flag != 0
-      }
-      FALSE => false,
-      _ => unreachable!(),
     }
+    .ok()
+    .map(|_| assert_eq!(return_length as usize, size_of_val(&flag)))
+    .map(|_| flag != 0)
+    .unwrap_or(false)
   }
 }
 
@@ -179,14 +175,15 @@ extern "system" fn ums_scheduler(
     scheduler_param,
   );
   while let Some(thread_context) = ums_scheduler_impl(cause) {
-    let ok = unsafe { ExecuteUmsThread(thread_context) };
-    // If `ExecuteUmsThread()` returns, it has failed.
-    assert_eq!(ok, FALSE);
-    cause = UmsSchedulerCallCause::from_execute_failure(thread_context);
+    // `ExecuteUmsThread()` does not return unless it fails.
+    let error = unsafe { ExecuteUmsThread(thread_context) }.unwrap_err();
+    cause = UmsSchedulerCallCause::from_execute_error(thread_context, error);
   }
 }
 
-fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
+fn ums_scheduler_impl(
+  cause: UmsSchedulerCallCause,
+) -> Option<*mut UMS_CONTEXT> {
   eprintln!("S: {:?}", cause);
   let mut state = UmsSchedulerState::get();
 
@@ -199,8 +196,7 @@ fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
       }
     }
     ThreadTerminated { thread_context } => {
-      let ok = unsafe { DeleteUmsThreadContext(thread_context) };
-      bool_to_result(ok).unwrap();
+      unsafe { DeleteUmsThreadContext(thread_context) }.unwrap();
       state.thread_count -= 1;
       if state.thread_count == 0 {
         return None;
@@ -211,7 +207,7 @@ fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
     | ThreadSuspended { thread_context } => {
       state.runnable_threads.push_back(thread_context);
     }
-    ThreadExecuteError {
+    ThreadExecuteFailed {
       thread_context,
       error,
     } => panic!("Failed to execute thread {:?}: {}", thread_context, error),
@@ -227,15 +223,15 @@ fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
       }
       None => {
         eprintln!("waiting for ready threads");
-        let mut list_item: PUMS_CONTEXT = null_mut();
-        let ok = unsafe {
+        let mut list_item: *mut UMS_CONTEXT = null_mut();
+        unsafe {
           DequeueUmsCompletionListItems(
             state.completion_list,
             INFINITE,
             &mut list_item,
           )
-        };
-        bool_to_result(ok).unwrap();
+        }
+        .unwrap();
         while !(list_item.is_null()) {
           eprintln!("w<r");
           state.runnable_threads.push_back(list_item);
@@ -248,13 +244,11 @@ fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
 
 pub fn run_ums_scheduler() -> io::Result<()> {
   unsafe {
-    let mut completion_list: PUMS_COMPLETION_LIST = null_mut();
-    let ok = CreateUmsCompletionList(&mut completion_list);
-    bool_to_result(ok)?;
+    let mut completion_list: *mut UMS_COMPLETION_LIST = null_mut();
+    CreateUmsCompletionList(&mut completion_list).result()?;
     assert!(!completion_list.is_null());
     let _completion_list_guard = guard(completion_list, |p| {
-      let ok = DeleteUmsCompletionList(p);
-      assert_eq!(ok, TRUE);
+      DeleteUmsCompletionList(p).unwrap();
     });
 
     UmsSchedulerState::init(completion_list);
@@ -266,10 +260,7 @@ pub fn run_ums_scheduler() -> io::Result<()> {
       SchedulerProc: Some(ums_scheduler),
       SchedulerParam: null_mut(),
     };
-    let ok = EnterUmsSchedulingMode(&mut scheduler_startup_info);
-    bool_to_result(ok)?;
-
-    Ok(())
+    EnterUmsSchedulingMode(&mut scheduler_startup_info).result()
   }
 }
 
@@ -282,29 +273,26 @@ unsafe extern "system" fn thread_main(_param: *mut VOID) -> DWORD {
 }
 
 fn create_ums_thread(
-  completion_list: PUMS_COMPLETION_LIST,
-) -> io::Result<PUMS_CONTEXT> {
+  completion_list: *mut UMS_COMPLETION_LIST,
+) -> io::Result<*mut UMS_CONTEXT> {
   unsafe {
     let mut thread_context = null_mut();
-    let ok = CreateUmsThreadContext(&mut thread_context);
-    bool_to_result(ok)?;
+    CreateUmsThreadContext(&mut thread_context).result()?;
     let thread_context = guard(thread_context, |c| {
-      let ok = DeleteUmsThreadContext(c);
-      bool_to_result(ok).unwrap();
+      DeleteUmsThreadContext(c).unwrap();
     });
 
     let mut attr_list_size = 0;
-    let ok =
-      InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size);
-    assert_eq!(ok, FALSE);
+    InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_list_size)
+      .unwrap_err::<()>();
     assert_ne!(attr_list_size, 0);
 
     let mut attr_list = repeat(0u8).take(attr_list_size).collect::<Box<[u8]>>();
     let attr_list: *mut PROC_THREAD_ATTRIBUTE_LIST =
       cast_aligned(attr_list.as_mut_ptr());
-    let ok =
-      InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size);
-    bool_to_result(ok)?;
+
+    InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_list_size)
+      .result()?;
     let attr_list = guard(attr_list, |p| DeleteProcThreadAttributeList(p));
 
     let attr = UMS_CREATE_THREAD_ATTRIBUTES {
@@ -313,7 +301,7 @@ fn create_ums_thread(
       UmsCompletionList: completion_list,
     };
 
-    let ok = UpdateProcThreadAttribute(
+    UpdateProcThreadAttribute(
       *attr_list,
       0,
       PROC_THREAD_ATTRIBUTE_UMS_THREAD,
@@ -321,8 +309,8 @@ fn create_ums_thread(
       size_of_val(&attr),
       null_mut(),
       null_mut(),
-    );
-    bool_to_result(ok)?;
+    )
+    .result()?;
 
     let thread_handle = CreateRemoteThreadEx(
       GetCurrentProcess(),
@@ -333,23 +321,13 @@ fn create_ums_thread(
       STACK_SIZE_PARAM_IS_A_RESERVATION,
       *attr_list,
       null_mut(),
-    );
-    match thread_handle {
-      h if h.is_null() => Err(io::Error::last_os_error())?,
-      h => bool_to_result(CloseHandle(h))?,
-    };
+    )
+    .result()?;
+    CloseHandle(thread_handle).result()?;
 
     eprintln!("UCTX: {:X?}", *thread_context);
 
     Ok(ScopeGuard::into_inner(thread_context))
-  }
-}
-
-fn bool_to_result(ok: BOOL) -> io::Result<()> {
-  match ok {
-    TRUE => Ok(()),
-    FALSE => Err(io::Error::last_os_error())?,
-    _ => unreachable!(),
   }
 }
 
