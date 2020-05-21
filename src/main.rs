@@ -1,3 +1,6 @@
+// Disable warnings that I don't thing are helpful.
+#![allow(clippy::try_err)]
+
 use derive_deref::*;
 use scopeguard::guard;
 
@@ -12,7 +15,8 @@ use std::ptr::null_mut;
 use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::minwindef::{FALSE, TRUE};
-
+use winapi::um::errhandlingapi::GetLastError;
+use winapi::um::handleapi::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
@@ -25,8 +29,7 @@ const UMS_VERSION: DWORD = RTL_UMS_VERSION;
 const PROC_THREAD_ATTRIBUTE_UMS_THREAD: DWORD_PTR =
   6 | 0x0001_0000 | 0x0002_0000;
 
-const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD =
-0x0001_0000;
+const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
 
 fn main() {
   unsafe { Sleep(1000) };
@@ -59,7 +62,7 @@ impl UmsSchedulerState {
     }
   }
 
-  pub fn init<'a>(completion_list: PUMS_COMPLETION_LIST) {
+  pub fn init(completion_list: PUMS_COMPLETION_LIST) {
     let state = Self::new(completion_list);
     let mut ref_mut = STATE.borrow_mut();
     let prev = ref_mut.replace(state);
@@ -72,58 +75,120 @@ impl UmsSchedulerState {
   }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum UmsSchedulerCallCause {
+  Startup {
+    param: *mut VOID,
+  },
+  ThreadBlockedOnTrap,
+  ThreadBlockedOnSyscall,
+  ThreadYield {
+    thread_context: PUMS_CONTEXT,
+    param: *mut VOID,
+  },
+  ThreadExecuteError {
+    thread_context: PUMS_CONTEXT,
+    error: DWORD,
+  },
+}
+
+impl UmsSchedulerCallCause {
+  pub fn from_scheduler_args(
+    reason: UMS_SCHEDULER_REASON,
+    activation_payload: ULONG_PTR,
+    scheduler_param: *mut VOID,
+  ) -> Self {
+    #[allow(non_upper_case_globals)]
+    match reason {
+      UmsSchedulerStartup => Self::Startup {
+        param: scheduler_param,
+      },
+      UmsSchedulerThreadBlocked if activation_payload == 0 => {
+        Self::ThreadBlockedOnTrap
+      }
+      UmsSchedulerThreadBlocked if activation_payload == 1 => {
+        Self::ThreadBlockedOnSyscall
+      }
+      UmsSchedulerThreadYield => Self::ThreadYield {
+        thread_context: activation_payload as PUMS_CONTEXT,
+        param: scheduler_param,
+      },
+      _ => unreachable!(),
+    }
+  }
+
+  pub fn from_last_error(thread_context: PUMS_CONTEXT) -> Self {
+    let error = unsafe { GetLastError() };
+    assert_ne!(error, 0);
+    Self::ThreadExecuteError {
+      thread_context,
+      error,
+    }
+  }
+}
+
 extern "system" fn ums_scheduler(
   reason: UMS_SCHEDULER_REASON,
   activation_payload: ULONG_PTR,
   scheduler_param: *mut VOID,
 ) {
-  unsafe {
-    eprintln!(
-      "S: {:?} {:?} {:?}",
-      reason, activation_payload, scheduler_param
-    );
+  // The `ExecuteUmsThread()` does not return if succesful, and certainly Rust
+  // does not expect that, so we are at risk of skipping Drop handlers.
+  // Therefore most of the "meat and potatoes" lives in `ums_scheduler_impl()`.
+  // We just have to be sure that no variables in this function require cleanup.
+  let mut cause = UmsSchedulerCallCause::from_scheduler_args(
+    reason,
+    activation_payload,
+    scheduler_param,
+  );
+  while let Some(thread_context) = ums_scheduler_impl(cause) {
+    let ok = unsafe { ExecuteUmsThread(thread_context) };
+    // ExecuteUmsThread does not return if successful.
+    assert_eq!(ok, FALSE);
+    cause = UmsSchedulerCallCause::from_last_error(thread_context);
+  }
+}
 
-    if reason == 0 {
-      eprintln!("n");
-      let mut state = UmsSchedulerState::get();
+fn ums_scheduler_impl(cause: UmsSchedulerCallCause) -> Option<PUMS_CONTEXT> {
+  eprintln!("S: {:?}", cause);
+  let mut state = UmsSchedulerState::get();
+
+  match cause {
+    UmsSchedulerCallCause::Startup { .. } => {
       let _main_thread = create_ums_thread(state.completion_list).unwrap();
       let _main_thread = create_ums_thread(state.completion_list).unwrap();
       let main_thread = create_ums_thread(state.completion_list).unwrap();
       state.main_thread = main_thread;
     }
+    UmsSchedulerCallCause::ThreadYield { thread_context, .. }
+    | UmsSchedulerCallCause::ThreadExecuteError { thread_context, .. } => {
+      state.ready_threads.push_back(thread_context);
+    }
+    _ => {}
+  };
 
-    loop {
-      loop {
-        eprintln!("l");
-        let t = {
-          let mut state = UmsSchedulerState::get();
-          state.ready_threads.pop_front()
-        };
-        match t {
-          Some(t) => {
-            println!("x PCTX: {:X?}", t);
-            let ok = ExecuteUmsThread(t);
-            eprintln!("ERR");
-            bool_to_result(ok).unwrap();
-          },
-          None => break,
-        }
+  loop {
+    eprintln!("selecting. ready# = {}", state.ready_threads.len());
+    match state.ready_threads.pop_front() {
+      Some(thread_context) => {
+        eprintln!("scheduling: {:X?}", thread_context);
+        break Some(thread_context);
       }
-
-      {
-        eprintln!("w");
-        let mut state = UmsSchedulerState::get();
-        let mut thread_list: PUMS_CONTEXT = null_mut();
-        let ok = DequeueUmsCompletionListItems(
-          state.completion_list,
-          INFINITE,
-          &mut thread_list,
-        );
+      None => {
+        eprintln!("waiting for ready threads");
+        let mut list_item: PUMS_CONTEXT = null_mut();
+        let ok = unsafe {
+          DequeueUmsCompletionListItems(
+            state.completion_list,
+            INFINITE,
+            &mut list_item,
+          )
+        };
         bool_to_result(ok).unwrap();
-        while !(thread_list.is_null()) {
+        while !(list_item.is_null()) {
           eprintln!("w<r");
-          state.ready_threads.push_back(thread_list);
-          thread_list = GetNextUmsListItem(thread_list);
+          state.ready_threads.push_back(list_item);
+          list_item = unsafe { GetNextUmsListItem(list_item) };
         }
       }
     }
@@ -159,7 +224,7 @@ fn run_ums_scheduler() -> io::Result<()> {
 
 unsafe extern "system" fn thread_main(_param: LPVOID) -> DWORD {
   for _ in 0..10 {
-    eprintln!("In da thread!!");
+    println!("In da thread!!");
     Sleep(1000);
   }
   123
@@ -228,8 +293,8 @@ fn create_ums_thread(
 
     eprintln!("tid: {}  UCTX: {:X?}", thread_id, ums_context);
 
-    //let ok = CloseHandle(thread_handle);
-    //bool_to_result(ok)?;
+    let ok = CloseHandle(thread_handle);
+    bool_to_result(ok)?;
 
     Ok(ums_context)
   }
