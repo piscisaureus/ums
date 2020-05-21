@@ -4,20 +4,23 @@
 mod win_result;
 mod winapi_extra;
 
+use crate::win_result::WinError;
 use crate::win_result::WinResult;
 use crate::winapi_extra::*;
-use derive_deref::*;
+
 use scopeguard::guard;
 use scopeguard::ScopeGuard;
-use std::cell::RefCell;
-use std::cell::RefMut;
+
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
 use std::iter::repeat;
 use std::mem::align_of;
+use std::mem::size_of;
 use std::mem::size_of_val;
+use std::mem::MaybeUninit;
 use std::ptr::null_mut;
+
 use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
 use winapi::shared::winerror::*;
@@ -27,42 +30,22 @@ use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
 
-static STATE: StaticState = StaticState(RefCell::new(None));
-
-#[derive(Deref, DerefMut)]
-struct StaticState(RefCell<Option<UmsSchedulerState>>);
-
-unsafe impl Send for StaticState {}
-unsafe impl Sync for StaticState {}
-
-struct UmsSchedulerState {
+struct SchedulerState {
   pub completion_list: *mut UMS_COMPLETION_LIST,
   pub runnable_threads: VecDeque<*mut UMS_CONTEXT>,
   pub thread_count: usize,
 }
 
-unsafe impl Send for UmsSchedulerState {}
-unsafe impl Sync for UmsSchedulerState {}
+unsafe impl Send for SchedulerState {}
+unsafe impl Sync for SchedulerState {}
 
-impl UmsSchedulerState {
+impl SchedulerState {
   pub fn new(completion_list: *mut UMS_COMPLETION_LIST) -> Self {
     Self {
       completion_list,
       runnable_threads: VecDeque::new(),
       thread_count: 0,
     }
-  }
-
-  pub fn init(completion_list: *mut UMS_COMPLETION_LIST) {
-    let state = Self::new(completion_list);
-    let mut ref_mut = STATE.borrow_mut();
-    let prev = ref_mut.replace(state);
-    assert!(prev.is_none());
-  }
-
-  pub fn get<'a>() -> RefMut<'a, Self> {
-    let ref_mut = STATE.borrow_mut();
-    RefMut::map(ref_mut, |r| r.as_mut().unwrap())
   }
 }
 
@@ -134,10 +117,10 @@ impl SchedulerEntryCause {
     let cause = match error {
       ERROR_RETRY => ThreadReadyCause::Busy,
       ERROR_SUCCESS => unreachable!(),
-      _ if Self::get_thread_flag(thread_context, UmsThreadIsTerminated) => {
+      _ if Self::get_ums_thread_flag(thread_context, UmsThreadIsTerminated) => {
         ThreadReadyCause::Terminated
       }
-      _ if Self::get_thread_flag(thread_context, UmsThreadIsSuspended) => {
+      _ if Self::get_ums_thread_flag(thread_context, UmsThreadIsSuspended) => {
         ThreadReadyCause::Suspended
       }
       error => {
@@ -151,25 +134,13 @@ impl SchedulerEntryCause {
     }
   }
 
-  fn get_thread_flag(
+  fn get_ums_thread_flag(
     thread_context: *mut UMS_CONTEXT,
-    thread_info_class: UMS_THREAD_INFO_CLASS,
+    ums_thread_info_class: UMS_THREAD_INFO_CLASS,
   ) -> bool {
-    let mut flag: BOOLEAN = 0;
-    let mut return_length: ULONG = 0;
-    unsafe {
-      QueryUmsThreadInformation(
-        thread_context,
-        thread_info_class,
-        &mut flag as *mut _ as *mut VOID,
-        size_of_val(&flag) as ULONG,
-        &mut return_length,
-      )
-    }
-    .ok()
-    .map(|_| assert_eq!(return_length as usize, size_of_val(&flag)))
-    .map(|_| flag != 0)
-    .unwrap_or(false)
+    get_ums_thread_info::<BOOLEAN, ()>(thread_context, ums_thread_info_class)
+      .map(|flag| flag != 0)
+      .unwrap_or(false)
   }
 }
 
@@ -197,10 +168,25 @@ extern "system" fn scheduler_entry(
 fn scheduler_entry_impl(
   cause: SchedulerEntryCause,
 ) -> Option<*mut UMS_CONTEXT> {
-  eprintln!("S: {:?}", cause);
-  let mut state = UmsSchedulerState::get();
-
   use SchedulerEntryCause::*;
+
+  eprintln!("S: {:?}", cause);
+
+  let state = unsafe {
+    GetCurrentUmsThread()
+      .result()
+      .and_then(|thread_context| match cause {
+        Startup { param } => {
+          let state = param as *mut SchedulerState;
+          set_ums_thread_info(thread_context, UmsThreadUserContext, state)
+            .map(|_| state)
+        }
+        _ => get_ums_thread_info(thread_context, UmsThreadUserContext),
+      })
+      .map(|state| &mut *state)
+      .unwrap()
+  };
+
   match cause {
     Startup { .. } => {
       for _ in 0..4 {
@@ -262,18 +248,17 @@ pub fn run_ums_scheduler() -> io::Result<()> {
     let mut completion_list: *mut UMS_COMPLETION_LIST = null_mut();
     CreateUmsCompletionList(&mut completion_list).result()?;
     assert!(!completion_list.is_null());
-    let _completion_list_guard = guard(completion_list, |p| {
-      DeleteUmsCompletionList(p).unwrap();
+    let completion_list = guard(completion_list, |l| {
+      DeleteUmsCompletionList(l).unwrap();
     });
 
-    UmsSchedulerState::init(completion_list);
-    assert_eq!(UmsSchedulerState::get().completion_list, completion_list);
+    let mut scheduler_state = SchedulerState::new(*completion_list);
 
     let mut scheduler_startup_info = UMS_SCHEDULER_STARTUP_INFO {
       UmsVersion: UMS_VERSION,
-      CompletionList: completion_list,
+      CompletionList: *completion_list,
       SchedulerProc: Some(scheduler_entry),
-      SchedulerParam: null_mut(),
+      SchedulerParam: &mut scheduler_state as *mut _ as *mut VOID,
     };
     EnterUmsSchedulingMode(&mut scheduler_startup_info).result()
   }
@@ -341,6 +326,43 @@ fn create_ums_thread(
     CloseHandle(thread_handle).result()?;
 
     Ok(ScopeGuard::into_inner(thread_context))
+  }
+}
+
+fn get_ums_thread_info<T: Copy + 'static, E: WinError>(
+  thread_context: *mut UMS_CONTEXT,
+  ums_thread_info_class: UMS_THREAD_INFO_CLASS,
+) -> Result<T, E> {
+  let mut info = MaybeUninit::<T>::uninit();
+  let info_size_in = size_of::<T>() as ULONG;
+  let mut info_size_out = MaybeUninit::<ULONG>::uninit();
+  unsafe {
+    QueryUmsThreadInformation(
+      thread_context,
+      ums_thread_info_class,
+      info.as_mut_ptr() as *mut VOID,
+      info_size_in,
+      info_size_out.as_mut_ptr(),
+    )
+    .ok_or_else(E::get_last_error)
+    .map(move |_| assert_eq!(info_size_in, info_size_out.assume_init()))
+    .map(move |_| info.assume_init())
+  }
+}
+
+fn set_ums_thread_info<T: Copy + 'static, E: WinError>(
+  thread_context: *mut UMS_CONTEXT,
+  ums_thread_info_class: UMS_THREAD_INFO_CLASS,
+  info: T,
+) -> Result<(), E> {
+  unsafe {
+    SetUmsThreadInformation(
+      thread_context,
+      ums_thread_info_class,
+      &info as *const T as *mut T as *mut VOID,
+      size_of::<T>() as ULONG,
+    )
+    .ok_or_else(E::get_last_error)
   }
 }
 

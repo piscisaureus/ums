@@ -14,12 +14,21 @@ pub trait WinResult: Sized {
   type Ok;
   fn ok(self) -> Option<Self::Ok>;
 
-  fn result(self) -> Result<Self::Ok, io::Error> {
-    self.ok().ok_or_else(io::Error::get_last_error)
+  fn ok_or_else<Err, F: FnOnce() -> Err>(
+    self,
+    err: F,
+  ) -> Result<Self::Ok, Err> {
+    self.ok().ok_or_else(err)
   }
+
+  fn result(self) -> Result<Self::Ok, io::Error> {
+    self.ok_or_else(io::Error::get_last_error)
+  }
+
   fn unwrap(self) -> Self::Ok {
     self.result().unwrap()
   }
+
   fn unwrap_err<Err>(self) -> Err
   where
     Self::Ok: Debug,
