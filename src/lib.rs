@@ -237,19 +237,20 @@ fn scheduler_entry_impl(
       }
       None => {
         eprintln!("waiting for ready threads");
-        let mut list_item: *mut UMS_CONTEXT = null_mut();
+        let mut thread_context_list_head: *mut UMS_CONTEXT = null_mut();
         unsafe {
           DequeueUmsCompletionListItems(
             state.completion_list,
             INFINITE,
-            &mut list_item,
+            &mut thread_context_list_head,
           )
         }
         .unwrap();
-        while !(list_item.is_null()) {
+        while !(thread_context_list_head.is_null()) {
           eprintln!("w<r");
-          state.runnable_threads.push_back(list_item);
-          list_item = unsafe { GetNextUmsListItem(list_item) };
+          state.runnable_threads.push_back(thread_context_list_head);
+          thread_context_list_head =
+            unsafe { GetNextUmsListItem(thread_context_list_head) };
         }
       }
     }
