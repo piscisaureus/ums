@@ -35,6 +35,7 @@ use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
+
 trait Job {
   fn on_schedule(
     &self,
@@ -169,6 +170,11 @@ where
     &self,
     _scheduler_state: &mut SchedulerState,
   ) -> Option<Execution> {
+    println!(
+      "Blocking job done. trap# = {}, syscall# = {}",
+      self.counts.get()[0],
+      self.counts.get()[1]
+    );
     Some(Execution::new(
       self.invoker,
       &self.event,
@@ -177,7 +183,7 @@ where
   }
 }
 
-fn blocking<F, R>(f: F) -> R
+pub fn blocking<F, R>(f: F) -> R
 where
   F: FnOnce() -> R + Send + 'static,
   R: 'static,
@@ -189,16 +195,18 @@ where
 #[derive(Copy, Clone)]
 enum ThreadEvent {
   None,
-  // Thread notifies scheduler of being available.
-  Startup,
   // Thread asks scheduler to delegate a job.
   ScheduleJob(*const dyn Job),
-  // Schedulure reports completion of a delegated job.
+  // Scheduler reports completion of a delegated job.
   CompleteJob,
+  // Thread notifies scheduler of being available.
+  ThreadStartup,
+  // Scheduler notifies thread that it should exit.
+  ThreadShutdown,
   // Scheduler assigns job to thread.
-  JobAssigned(*const dyn Job),
-  // Job notifies scheduler of job completion.
-  JobFinished(*const dyn Job),
+  ThreadAssignedJob(*const dyn Job),
+  // Thread notifies scheduler of job completion.
+  ThreadCompleteJob(*const dyn Job),
 }
 
 impl Default for ThreadEvent {
@@ -208,14 +216,12 @@ impl Default for ThreadEvent {
 }
 
 struct ThreadState {
-  ums_thread_context: *mut UMS_CONTEXT,
   event: Cell<ThreadEvent>,
 }
 
 impl ThreadState {
   pub fn new() -> Self {
     Self {
-      ums_thread_context: unsafe { GetCurrentUmsThread() }.unwrap(),
       event: Default::default(),
     }
   }
@@ -236,24 +242,41 @@ impl ThreadState {
   }
 }
 
-unsafe extern "system" fn thread_main_1(_: *mut VOID) -> DWORD {
+unsafe extern "system" fn thread_main(_: *mut VOID) -> DWORD {
   let mut state = ThreadState::new();
-  set_ums_thread_info::<*mut ThreadState, io::Error>(
-    state.ums_thread_context,
-    UmsThreadUserContext,
-    &mut state,
-  )
-  .unwrap();
-
-  state.yield_event(ThreadEvent::Startup);
+  state.yield_event(ThreadEvent::ThreadStartup);
   loop {
     match state.get_event() {
-      ThreadEvent::JobAssigned(job) => {
-        unsafe { (*job).main(&mut state) };
-        state.yield_event(ThreadEvent::JobFinished(job))
+      ThreadEvent::ThreadAssignedJob(job) => {
+        (*job).main(&mut state);
+        state.yield_event(ThreadEvent::ThreadCompleteJob(job))
+      }
+      ThreadEvent::ThreadShutdown => {
+        while current_thread_has_io_pending().unwrap() {
+          match SleepEx(10_000, TRUE) {
+            0 => break,
+            WAIT_IO_COMPLETION => {}
+            _ => unreachable!(),
+          }
+        }
+        println!("Thread stopped");
+        return 0;
       }
       _ => unreachable!(),
     }
+  }
+}
+
+fn current_thread_has_io_pending() -> Result<bool, io::Error> {
+  unsafe {
+    let mut io_pending_flag = FALSE;
+    GetThreadIOPendingFlag(GetCurrentThread(), &mut io_pending_flag)
+      .result()
+      .map(|_| match io_pending_flag {
+        TRUE => true,
+        FALSE => false,
+        _ => unreachable!(),
+      })
   }
 }
 
@@ -306,6 +329,7 @@ impl Execution {
 
 struct SchedulerState {
   pub queued_jobs: VecDeque<*const dyn Job>,
+  pub total_job_count: usize,
   pub idle_threads: VecDeque<Executor>,
   pub runnable_threads: VecDeque<*mut UMS_CONTEXT>,
   pub thread_count_starting: usize,
@@ -322,8 +346,10 @@ impl SchedulerState {
     ums_completion_list: *mut UMS_COMPLETION_LIST,
     queued_jobs: VecDeque<*const dyn Job>,
   ) -> Self {
+    let total_job_count = queued_jobs.len();
     Self {
       queued_jobs,
+      total_job_count,
       idle_threads: VecDeque::new(),
       runnable_threads: VecDeque::new(),
       thread_count_starting: 0,
@@ -484,18 +510,12 @@ fn scheduler_entry_impl(
   };
 
   let next_execution = match cause {
-    Startup { .. } => {
-      for _ in 0..4 {
-        let _ = create_ums_thread(state.ums_completion_list).unwrap();
-        state.thread_count_total += 1;
-      }
-      None
-    }
+    Startup { .. } => None,
     ThreadBlocked { cause } => state
       .last_execution
       .as_ref()
       .and_then(|e| match e.event {
-        ThreadEvent::JobAssigned(job) => Some(job),
+        ThreadEvent::ThreadAssignedJob(job) => Some(job),
         _ => None,
       })
       .and_then(|job| unsafe { (*job).on_blocking(state, cause) }),
@@ -506,20 +526,23 @@ fn scheduler_entry_impl(
       let event_slot = unsafe { &*(param as *mut Cell<ThreadEvent>) };
       let event = event_slot.get();
       match event {
-        ThreadEvent::Startup => {
+        ThreadEvent::ThreadStartup => {
           state
             .idle_threads
             .push_back(Executor::new(ums_thread_context, event_slot));
+          state.thread_count_starting -= 1;
           None
         }
         ThreadEvent::ScheduleJob(job) => {
           state.queued_jobs.push_back(job);
+          state.total_job_count += 1;
           unsafe { (*job).on_schedule(state, ums_thread_context) }
         }
-        ThreadEvent::JobFinished(job) => {
+        ThreadEvent::ThreadCompleteJob(job) => {
           state
             .idle_threads
             .push_back(Executor::new(ums_thread_context, event_slot));
+          state.total_job_count -= 1;
           unsafe { (*job).on_complete(state) }
         }
         _ => unreachable!(),
@@ -555,21 +578,44 @@ fn scheduler_entry_impl(
     let execution = Execution::new(
       executor.ums_thread_context,
       executor.event_slot,
-      ThreadEvent::JobAssigned(job),
+      ThreadEvent::ThreadAssignedJob(job),
     );
     return execution.execute(state);
   }
-  if state.queued_jobs.is_empty() && state.thread_count_total == 0 {
-    return None;
+  if state.total_job_count > 0 {
+    // Create extra UMS threads. We aim to always have one spare.
+    // If there are no jobs at all this step is skipped, as we should be shutting
+    // down rather than bringing new threads up.
+    const THREADS_SPARE: usize = 1;
+    let threads_avail = state.idle_threads.len() + state.thread_count_starting;
+    let threads_needed = state.queued_jobs.len() + THREADS_SPARE;
+    let threads_short = threads_needed.saturating_sub(threads_avail);
+    for _ in 0..threads_short {
+      create_ums_thread(state.ums_completion_list).unwrap();
+      state.thread_count_starting += 1;
+      state.thread_count_total += 1;
+    }
+  } else {
+    // No more jobs, so shut down threads.
+    if let Some(executor) = state.idle_threads.pop_back() {
+      let execution = Execution::new(
+        executor.ums_thread_context,
+        executor.event_slot,
+        ThreadEvent::ThreadShutdown,
+      );
+      return execution.execute(state);
+    }
+    if state.thread_count_total == 0 {
+      assert!(state.thread_count_starting == 0);
+      return None;
+    }
   }
-
-  let threads_avail = state.idle_threads.len() + state.thread_count_starting;
-  let threads_needed = state.queued_jobs.len() + 1; // Aim to always have a spare thread.
-  let threads_short = threads_needed.saturating_sub(threads_avail);
-  for _ in 0..threads_short {
-    create_ums_thread(state.ums_completion_list).unwrap();
-    state.thread_count_starting += 1;
-  }
+  eprintln!(
+    "#### {:?} {:?} {:?}",
+    state.idle_threads.len(),
+    state.thread_count_total,
+    state.total_job_count,
+  );
 
   loop {
     eprintln!("selecting. ready# = {}", state.runnable_threads.len());
@@ -631,14 +677,6 @@ where
     };
     EnterUmsSchedulingMode(&mut scheduler_startup_info).result()
   }
-}
-
-unsafe extern "system" fn thread_main(_param: *mut VOID) -> DWORD {
-  for _ in 0..10 {
-    println!("In thread {:?}", GetCurrentUmsThread());
-    Sleep(1000);
-  }
-  123
 }
 
 fn create_ums_thread(
