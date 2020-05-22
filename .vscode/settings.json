@@ -6,7 +6,7 @@
         "winapi/everything"
     ],
     "lldb.displayFormat": "auto",
-    "lldb.showDisassembly": "auto",
+    "lldb.showDisassembly": "always",
     "lldb.dereferencePointers": true,
     "rust-analyzer.cargo.loadOutDirsFromCheck": true,
     "rust-analyzer.checkOnSave.command": "clippy",

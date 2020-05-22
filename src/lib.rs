@@ -11,15 +11,22 @@ use crate::winapi_extra::*;
 use scopeguard::guard;
 use scopeguard::ScopeGuard;
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::future::Future;
 use std::io;
 use std::iter::repeat;
 use std::mem::align_of;
+use std::mem::replace;
 use std::mem::size_of;
 use std::mem::size_of_val;
+use std::mem::transmute;
 use std::mem::MaybeUninit;
+use std::pin::Pin;
+use std::ptr;
 use std::ptr::null_mut;
+use std::ptr::NonNull;
 
 use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
@@ -30,21 +37,120 @@ use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
 
+enum DelegationState {
+  Queued,
+  Delegated {
+    ums_thread_context: *mut UMS_CONTEXT,
+  },
+}
+
+enum NotificationMode {
+  ExecuteThread {
+    ums_thread_context: *mut UMS_CONTEXT,
+  },
+}
+
+trait Job {
+  fn main(&mut self) {}
+  fn on_blocking(&mut self) -> Option<*mut UMS_CONTEXT> {
+    None
+  }
+  fn on_complete(&mut self) -> Option<*mut UMS_CONTEXT> {
+    None
+  }
+}
+
+#[derive(Copy, Clone)]
+enum ThreadEvent {
+  None,
+  // Thread notifies scheduler of being available.
+  Startup,
+  // Thread asks scheduler to delegate a job.
+  RequestJob(*mut dyn Job),
+  // Scheduler assigns job to thread.
+  JobAssigned(*mut dyn Job),
+  // Job notifies scheduler of job completion.
+  JobFinished(*mut dyn Job),
+}
+
+impl Default for ThreadEvent {
+  fn default() -> Self {
+    Self::None
+  }
+}
+
+struct ThreadState {
+  ums_thread_context: *mut UMS_CONTEXT,
+  event: Cell<ThreadEvent>,
+}
+
+impl ThreadState {
+  pub fn new() -> Self {
+    Self {
+      ums_thread_context: unsafe { GetCurrentUmsThread() }.unwrap(),
+      event: Default::default(),
+    }
+  }
+
+  pub fn set_event(&mut self, event: ThreadEvent) {
+    self.event = Cell::new(event);
+  }
+
+  pub fn yield_event(&mut self, event: ThreadEvent) {
+    self.set_event(event);
+    let param = self as *mut _ as *mut VOID;
+    unsafe { UmsThreadYield(param) }.unwrap();
+  }
+
+  pub fn get_event(&self) -> ThreadEvent {
+    self.event.get()
+  }
+}
+
+unsafe extern "system" fn thread_main_1(_: *mut VOID) -> DWORD {
+  let mut state = ThreadState::new();
+  set_ums_thread_info::<*mut ThreadState, io::Error>(
+    state.ums_thread_context,
+    UmsThreadUserContext,
+    &mut state,
+  )
+  .unwrap();
+
+  state.yield_event(ThreadEvent::Startup);
+  loop {
+    match state.get_event() {
+      ThreadEvent::JobAssigned(job) => {
+        unsafe { (*job).main() };
+        state.yield_event(ThreadEvent::JobFinished(job))
+      }
+      _ => unreachable!(),
+    }
+  }
+}
+
 struct SchedulerState {
-  pub completion_list: *mut UMS_COMPLETION_LIST,
+  pub queued_jobs: VecDeque<*mut dyn Job>,
+  pub idle_threads: VecDeque<*mut UMS_CONTEXT>,
   pub runnable_threads: VecDeque<*mut UMS_CONTEXT>,
-  pub thread_count: usize,
+  pub thread_count_starting: usize,
+  pub thread_count_total: usize,
+  pub last_executed_thread: Option<NonNull<ThreadState>>,
+  pub ums_completion_list: *mut UMS_COMPLETION_LIST,
 }
 
 unsafe impl Send for SchedulerState {}
 unsafe impl Sync for SchedulerState {}
 
 impl SchedulerState {
-  pub fn new(completion_list: *mut UMS_COMPLETION_LIST) -> Self {
+  pub fn new(ums_completion_list: *mut UMS_COMPLETION_LIST) -> Self {
     Self {
-      completion_list,
+      queued_jobs: VecDeque::new(),
+      idle_threads: VecDeque::new(),
       runnable_threads: VecDeque::new(),
-      thread_count: 0,
+      thread_count_starting: 0,
+      thread_count_total: 0,
+      last_executed_thread: None,
+      ums_completion_list,
     }
   }
 }
@@ -74,7 +180,7 @@ enum SchedulerEntryCause {
     cause: ThreadBlockedCause,
   },
   ThreadReady {
-    thread_context: *mut UMS_CONTEXT,
+    ums_thread_context: *mut UMS_CONTEXT,
     cause: ThreadReadyCause,
   },
 }
@@ -104,23 +210,31 @@ impl SchedulerEntryCause {
         cause: ThreadReadyCause::Yield {
           param: scheduler_param,
         },
-        thread_context: activation_payload as *mut UMS_CONTEXT,
+        ums_thread_context: activation_payload as *mut UMS_CONTEXT,
       },
       _ => unreachable!(),
     }
   }
 
   pub fn from_execute_error(
-    thread_context: *mut UMS_CONTEXT,
+    ums_thread_context: *mut UMS_CONTEXT,
     error: DWORD,
   ) -> Self {
     let cause = match error {
       ERROR_RETRY => ThreadReadyCause::Busy,
       ERROR_SUCCESS => unreachable!(),
-      _ if Self::get_ums_thread_flag(thread_context, UmsThreadIsTerminated) => {
+      _ if Self::get_ums_thread_flag(
+        ums_thread_context,
+        UmsThreadIsTerminated,
+      ) =>
+      {
         ThreadReadyCause::Terminated
       }
-      _ if Self::get_ums_thread_flag(thread_context, UmsThreadIsSuspended) => {
+      _ if Self::get_ums_thread_flag(
+        ums_thread_context,
+        UmsThreadIsSuspended,
+      ) =>
+      {
         ThreadReadyCause::Suspended
       }
       error => {
@@ -129,18 +243,21 @@ impl SchedulerEntryCause {
       }
     };
     Self::ThreadReady {
-      thread_context,
+      ums_thread_context,
       cause,
     }
   }
 
   fn get_ums_thread_flag(
-    thread_context: *mut UMS_CONTEXT,
+    ums_thread_context: *mut UMS_CONTEXT,
     ums_thread_info_class: UMS_THREAD_INFO_CLASS,
   ) -> bool {
-    get_ums_thread_info::<BOOLEAN, ()>(thread_context, ums_thread_info_class)
-      .map(|flag| flag != 0)
-      .unwrap_or(false)
+    get_ums_thread_info::<BOOLEAN, ()>(
+      ums_thread_context,
+      ums_thread_info_class,
+    )
+    .map(|flag| flag != 0)
+    .unwrap_or(false)
   }
 }
 
@@ -158,10 +275,10 @@ extern "system" fn scheduler_entry(
     activation_payload,
     scheduler_param,
   );
-  while let Some(thread_context) = scheduler_entry_impl(cause) {
+  while let Some(ums_thread_context) = scheduler_entry_impl(cause) {
     // `ExecuteUmsThread()` does not return unless it fails.
-    let error = unsafe { ExecuteUmsThread(thread_context) }.unwrap_err();
-    cause = SchedulerEntryCause::from_execute_error(thread_context, error);
+    let error = unsafe { ExecuteUmsThread(ums_thread_context) }.unwrap_err();
+    cause = SchedulerEntryCause::from_execute_error(ums_thread_context, error);
   }
 }
 
@@ -175,68 +292,96 @@ fn scheduler_entry_impl(
   let state = unsafe {
     GetCurrentUmsThread()
       .result()
-      .and_then(|thread_context| match cause {
+      .and_then(|ums_thread_context| match cause {
         Startup { param } => {
           let state = param as *mut SchedulerState;
-          set_ums_thread_info(thread_context, UmsThreadUserContext, state)
+          set_ums_thread_info(ums_thread_context, UmsThreadUserContext, state)
             .map(|_| state)
         }
-        _ => get_ums_thread_info(thread_context, UmsThreadUserContext),
+        _ => get_ums_thread_info(ums_thread_context, UmsThreadUserContext),
       })
       .map(|state| &mut *state)
       .unwrap()
   };
 
-  match cause {
+  let next_thread = match cause {
     Startup { .. } => {
       for _ in 0..4 {
-        let _ = create_ums_thread(state.completion_list).unwrap();
-        state.thread_count += 1;
+        let _ = create_ums_thread(state.ums_completion_list).unwrap();
+        state.thread_count_total += 1;
       }
+      None
+    }
+    ThreadBlocked { .. } => state
+      .last_executed_thread
+      .map(|thread_state| unsafe { thread_state.as_ref().get_event() })
+      .and_then(|thread_event| match thread_event {
+        ThreadEvent::JobAssigned(job) => Some(job),
+        _ => None,
+      })
+      .and_then(|job| unsafe { (*job).on_blocking() }),
+    ThreadReady {
+      ums_thread_context,
+      cause: ThreadReadyCause::Yield { param },
+    } => {
+      let thread_state = unsafe { &*(param as *mut ThreadState) };
+      debug_assert_eq!(ums_thread_context, thread_state.ums_thread_context);
+      None
     }
     ThreadReady {
-      thread_context,
+      ums_thread_context,
       cause: ThreadReadyCause::Terminated,
     } => {
-      unsafe { DeleteUmsThreadContext(thread_context) }.unwrap();
-      state.thread_count -= 1;
-      if state.thread_count == 0 {
-        return None;
-      }
+      unsafe { DeleteUmsThreadContext(ums_thread_context) }.unwrap();
+      state.thread_count_total -= 1;
+      None
     }
     ThreadReady {
-      thread_context,
+      ums_thread_context,
       cause: ThreadReadyCause::ExecuteFailed { error },
-    } => panic!("Failed to execute thread {:?}: {}", thread_context, error),
-    ThreadReady { thread_context, .. } => {
-      state.runnable_threads.push_back(thread_context)
+    } => panic!("ExecuteUmsThread({:?}): {}", ums_thread_context, error),
+    ThreadReady {
+      ums_thread_context, ..
+    } => {
+      state.runnable_threads.push_back(ums_thread_context);
+      None
     }
-    _ => {}
   };
+  state.last_executed_thread.take();
+
+  if let Some(ums_thread_context) = next_thread {
+    return Some(ums_thread_context);
+  }
+
+  if state.queued_jobs.is_empty() && state.thread_count_total == 0 {
+    return None;
+  }
 
   loop {
     eprintln!("selecting. ready# = {}", state.runnable_threads.len());
     match state.runnable_threads.pop_front() {
-      Some(thread_context) => {
-        eprintln!("scheduling: {:X?}", thread_context);
-        break Some(thread_context);
+      Some(ums_thread_context) => {
+        eprintln!("scheduling: {:X?}", ums_thread_context);
+        break Some(ums_thread_context);
       }
       None => {
         eprintln!("waiting for ready threads");
-        let mut thread_context_list_head: *mut UMS_CONTEXT = null_mut();
+        let mut ums_thread_context_list_head: *mut UMS_CONTEXT = null_mut();
         unsafe {
           DequeueUmsCompletionListItems(
-            state.completion_list,
+            state.ums_completion_list,
             INFINITE,
-            &mut thread_context_list_head,
+            &mut ums_thread_context_list_head,
           )
         }
         .unwrap();
-        while !(thread_context_list_head.is_null()) {
+        while !(ums_thread_context_list_head.is_null()) {
           eprintln!("w<r");
-          state.runnable_threads.push_back(thread_context_list_head);
-          thread_context_list_head =
-            unsafe { GetNextUmsListItem(thread_context_list_head) };
+          state
+            .runnable_threads
+            .push_back(ums_thread_context_list_head);
+          ums_thread_context_list_head =
+            unsafe { GetNextUmsListItem(ums_thread_context_list_head) };
         }
       }
     }
@@ -245,18 +390,18 @@ fn scheduler_entry_impl(
 
 pub fn run_ums_scheduler() -> io::Result<()> {
   unsafe {
-    let mut completion_list: *mut UMS_COMPLETION_LIST = null_mut();
-    CreateUmsCompletionList(&mut completion_list).result()?;
-    assert!(!completion_list.is_null());
-    let completion_list = guard(completion_list, |l| {
+    let mut ums_completion_list: *mut UMS_COMPLETION_LIST = null_mut();
+    CreateUmsCompletionList(&mut ums_completion_list).result()?;
+    assert!(!ums_completion_list.is_null());
+    let ums_completion_list = guard(ums_completion_list, |l| {
       DeleteUmsCompletionList(l).unwrap();
     });
 
-    let mut scheduler_state = SchedulerState::new(*completion_list);
+    let mut scheduler_state = SchedulerState::new(*ums_completion_list);
 
     let mut scheduler_startup_info = UMS_SCHEDULER_STARTUP_INFO {
       UmsVersion: UMS_VERSION,
-      CompletionList: *completion_list,
+      CompletionList: *ums_completion_list,
       SchedulerProc: Some(scheduler_entry),
       SchedulerParam: &mut scheduler_state as *mut _ as *mut VOID,
     };
@@ -273,12 +418,12 @@ unsafe extern "system" fn thread_main(_param: *mut VOID) -> DWORD {
 }
 
 fn create_ums_thread(
-  completion_list: *mut UMS_COMPLETION_LIST,
+  ums_completion_list: *mut UMS_COMPLETION_LIST,
 ) -> io::Result<*mut UMS_CONTEXT> {
   unsafe {
-    let mut thread_context = null_mut();
-    CreateUmsThreadContext(&mut thread_context).result()?;
-    let thread_context = guard(thread_context, |c| {
+    let mut ums_thread_context = null_mut();
+    CreateUmsThreadContext(&mut ums_thread_context).result()?;
+    let ums_thread_context = guard(ums_thread_context, |c| {
       DeleteUmsThreadContext(c).unwrap();
     });
 
@@ -297,8 +442,8 @@ fn create_ums_thread(
 
     let attr = UMS_CREATE_THREAD_ATTRIBUTES {
       UmsVersion: UMS_VERSION,
-      UmsContext: *thread_context,
-      UmsCompletionList: completion_list,
+      UmsContext: *ums_thread_context,
+      UmsCompletionList: ums_completion_list,
     };
 
     UpdateProcThreadAttribute(
@@ -325,12 +470,12 @@ fn create_ums_thread(
     .result()?;
     CloseHandle(thread_handle).result()?;
 
-    Ok(ScopeGuard::into_inner(thread_context))
+    Ok(ScopeGuard::into_inner(ums_thread_context))
   }
 }
 
 fn get_ums_thread_info<T: Copy + 'static, E: WinError>(
-  thread_context: *mut UMS_CONTEXT,
+  ums_thread_context: *mut UMS_CONTEXT,
   ums_thread_info_class: UMS_THREAD_INFO_CLASS,
 ) -> Result<T, E> {
   let mut info = MaybeUninit::<T>::uninit();
@@ -338,7 +483,7 @@ fn get_ums_thread_info<T: Copy + 'static, E: WinError>(
   let mut info_size_out = MaybeUninit::<ULONG>::uninit();
   unsafe {
     QueryUmsThreadInformation(
-      thread_context,
+      ums_thread_context,
       ums_thread_info_class,
       info.as_mut_ptr() as *mut VOID,
       info_size_in,
@@ -351,13 +496,13 @@ fn get_ums_thread_info<T: Copy + 'static, E: WinError>(
 }
 
 fn set_ums_thread_info<T: Copy + 'static, E: WinError>(
-  thread_context: *mut UMS_CONTEXT,
+  ums_thread_context: *mut UMS_CONTEXT,
   ums_thread_info_class: UMS_THREAD_INFO_CLASS,
   info: T,
 ) -> Result<(), E> {
   unsafe {
     SetUmsThreadInformation(
-      thread_context,
+      ums_thread_context,
       ums_thread_info_class,
       &info as *const T as *mut T as *mut VOID,
       size_of::<T>() as ULONG,
