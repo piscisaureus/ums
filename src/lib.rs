@@ -14,19 +14,18 @@ use scopeguard::ScopeGuard;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::future::Future;
+
 use std::io;
+use std::iter::once;
 use std::iter::repeat;
 use std::mem::align_of;
-use std::mem::replace;
+
 use std::mem::size_of;
 use std::mem::size_of_val;
-use std::mem::transmute;
+
 use std::mem::MaybeUninit;
-use std::pin::Pin;
-use std::ptr;
+
 use std::ptr::null_mut;
-use std::ptr::NonNull;
 
 use winapi::shared::basetsd::*;
 use winapi::shared::minwindef::*;
@@ -36,28 +35,155 @@ use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::*;
 use winapi::um::winbase::*;
 use winapi::um::winnt::*;
-
-enum DelegationState {
-  Queued,
-  Delegated {
-    ums_thread_context: *mut UMS_CONTEXT,
-  },
-}
-
-enum NotificationMode {
-  ExecuteThread {
-    ums_thread_context: *mut UMS_CONTEXT,
-  },
-}
-
 trait Job {
-  fn main(&mut self) {}
-  fn on_blocking(&mut self) -> Option<*mut UMS_CONTEXT> {
+  fn on_schedule(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+    _invoker_ums_thread_context: *mut UMS_CONTEXT,
+  ) -> Option<Execution> {
     None
   }
-  fn on_complete(&mut self) -> Option<*mut UMS_CONTEXT> {
+  fn main(&self, _thread_state: &mut ThreadState) {}
+  fn on_blocking(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+    _cause: ThreadBlockedCause,
+  ) -> Option<Execution> {
     None
   }
+  fn on_complete(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+  ) -> Option<Execution> {
+    None
+  }
+}
+
+enum TopLevelJobState<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  Empty,
+  Function(F),
+  Result(R),
+}
+struct TopLevelJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  state: Cell<TopLevelJobState<F, R>>,
+}
+impl<F, R> TopLevelJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  pub fn new(f: F) -> Self {
+    let state = TopLevelJobState::Function(f);
+    let state = Cell::new(state);
+    Self { state }
+  }
+}
+impl<F, R> Job for TopLevelJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  fn main(&self, _scheduler_state: &mut ThreadState) {
+    use TopLevelJobState as S;
+    let state = self.state.replace(S::Empty);
+    self.state.set(match state {
+      S::Function(f) => S::Result(f()),
+      _ => unreachable!(),
+    })
+  }
+  fn on_complete(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+  ) -> Option<Execution> {
+    eprintln!("Top level job done.");
+    None
+  }
+}
+
+enum BlockingJobState<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  Empty,
+  Function(F),
+  Result(R),
+}
+struct BlockingJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  invoker: *mut UMS_CONTEXT,
+  event: Cell<ThreadEvent>,
+  state: Cell<BlockingJobState<F, R>>,
+  counts: Cell<[usize; 2]>,
+}
+impl<F, R> BlockingJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+  R: 'static,
+{
+  pub fn new(f: F) -> Self {
+    Self {
+      invoker: unsafe { GetCurrentUmsThread() }.unwrap(),
+      event: Default::default(),
+      state: Cell::new(BlockingJobState::Function(f)),
+      counts: Default::default(),
+    }
+  }
+  pub fn run(&self) -> R {
+    self.event.set(ThreadEvent::ScheduleJob(self as &dyn Job));
+    unsafe { UmsThreadYield(self.event.as_ptr() as *mut VOID) }.unwrap();
+    match self.state.replace(BlockingJobState::Empty) {
+      BlockingJobState::Result(r) => r,
+      _ => unreachable!(),
+    }
+  }
+}
+impl<F, R> Job for BlockingJob<F, R>
+where
+  F: FnOnce() -> R + Send + 'static,
+{
+  fn main(&self, _scheduler_state: &mut ThreadState) {
+    use BlockingJobState as S;
+    let state = self.state.replace(S::Empty);
+    self.state.set(match state {
+      S::Function(f) => S::Result(f()),
+      _ => unreachable!(),
+    })
+  }
+  fn on_blocking(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+    cause: ThreadBlockedCause,
+  ) -> Option<Execution> {
+    let mut counts = self.counts.get();
+    counts[cause as usize] += 1;
+    self.counts.set(counts);
+    None
+  }
+  fn on_complete(
+    &self,
+    _scheduler_state: &mut SchedulerState,
+  ) -> Option<Execution> {
+    Some(Execution::new(
+      self.invoker,
+      &self.event,
+      ThreadEvent::CompleteJob,
+    ))
+  }
+}
+
+fn blocking<F, R>(f: F) -> R
+where
+  F: FnOnce() -> R + Send + 'static,
+  R: 'static,
+{
+  let job = BlockingJob::new(f);
+  job.run()
 }
 
 #[derive(Copy, Clone)]
@@ -66,11 +192,13 @@ enum ThreadEvent {
   // Thread notifies scheduler of being available.
   Startup,
   // Thread asks scheduler to delegate a job.
-  RequestJob(*mut dyn Job),
+  ScheduleJob(*const dyn Job),
+  // Schedulure reports completion of a delegated job.
+  CompleteJob,
   // Scheduler assigns job to thread.
-  JobAssigned(*mut dyn Job),
+  JobAssigned(*const dyn Job),
   // Job notifies scheduler of job completion.
-  JobFinished(*mut dyn Job),
+  JobFinished(*const dyn Job),
 }
 
 impl Default for ThreadEvent {
@@ -92,13 +220,14 @@ impl ThreadState {
     }
   }
 
-  pub fn set_event(&mut self, event: ThreadEvent) {
-    self.event = Cell::new(event);
+  pub fn set_event(&self, event: ThreadEvent) {
+    self.event.set(event);
   }
 
-  pub fn yield_event(&mut self, event: ThreadEvent) {
+  pub fn yield_event(&self, event: ThreadEvent) {
     self.set_event(event);
-    let param = self as *mut _ as *mut VOID;
+    let param = &self.event as *const Cell<ThreadEvent>
+      as *mut Cell<ThreadEvent> as *mut VOID;
     unsafe { UmsThreadYield(param) }.unwrap();
   }
 
@@ -120,7 +249,7 @@ unsafe extern "system" fn thread_main_1(_: *mut VOID) -> DWORD {
   loop {
     match state.get_event() {
       ThreadEvent::JobAssigned(job) => {
-        unsafe { (*job).main() };
+        unsafe { (*job).main(&mut state) };
         state.yield_event(ThreadEvent::JobFinished(job))
       }
       _ => unreachable!(),
@@ -128,13 +257,60 @@ unsafe extern "system" fn thread_main_1(_: *mut VOID) -> DWORD {
   }
 }
 
+struct Executor {
+  ums_thread_context: *mut UMS_CONTEXT,
+  event_slot: *const Cell<ThreadEvent>,
+}
+
+impl Executor {
+  pub fn new(
+    ums_thread_context: *mut UMS_CONTEXT,
+    event_slot: *const Cell<ThreadEvent>,
+  ) -> Self {
+    Self {
+      ums_thread_context,
+      event_slot,
+    }
+  }
+}
+
+struct Execution {
+  ums_thread_context: *mut UMS_CONTEXT,
+  event_slot: *const Cell<ThreadEvent>,
+  event: ThreadEvent,
+}
+
+impl Execution {
+  pub fn new(
+    ums_thread_context: *mut UMS_CONTEXT,
+    event_slot: *const Cell<ThreadEvent>,
+    event: ThreadEvent,
+  ) -> Self {
+    Self {
+      ums_thread_context,
+      event_slot,
+      event,
+    }
+  }
+
+  pub fn execute(
+    self,
+    scheduler_state: &mut SchedulerState,
+  ) -> Option<*mut UMS_CONTEXT> {
+    let ums_thread_context = self.ums_thread_context;
+    unsafe { &*self.event_slot }.set(self.event);
+    scheduler_state.last_execution = Some(self);
+    Some(ums_thread_context)
+  }
+}
+
 struct SchedulerState {
-  pub queued_jobs: VecDeque<*mut dyn Job>,
-  pub idle_threads: VecDeque<*mut UMS_CONTEXT>,
+  pub queued_jobs: VecDeque<*const dyn Job>,
+  pub idle_threads: VecDeque<Executor>,
   pub runnable_threads: VecDeque<*mut UMS_CONTEXT>,
   pub thread_count_starting: usize,
   pub thread_count_total: usize,
-  pub last_executed_thread: Option<NonNull<ThreadState>>,
+  pub last_execution: Option<Execution>,
   pub ums_completion_list: *mut UMS_COMPLETION_LIST,
 }
 
@@ -142,14 +318,17 @@ unsafe impl Send for SchedulerState {}
 unsafe impl Sync for SchedulerState {}
 
 impl SchedulerState {
-  pub fn new(ums_completion_list: *mut UMS_COMPLETION_LIST) -> Self {
+  pub fn new(
+    ums_completion_list: *mut UMS_COMPLETION_LIST,
+    queued_jobs: VecDeque<*const dyn Job>,
+  ) -> Self {
     Self {
-      queued_jobs: VecDeque::new(),
+      queued_jobs,
       idle_threads: VecDeque::new(),
       runnable_threads: VecDeque::new(),
       thread_count_starting: 0,
       thread_count_total: 0,
-      last_executed_thread: None,
+      last_execution: None,
       ums_completion_list,
     }
   }
@@ -304,7 +483,7 @@ fn scheduler_entry_impl(
       .unwrap()
   };
 
-  let next_thread = match cause {
+  let next_execution = match cause {
     Startup { .. } => {
       for _ in 0..4 {
         let _ = create_ums_thread(state.ums_completion_list).unwrap();
@@ -312,21 +491,39 @@ fn scheduler_entry_impl(
       }
       None
     }
-    ThreadBlocked { .. } => state
-      .last_executed_thread
-      .map(|thread_state| unsafe { thread_state.as_ref().get_event() })
-      .and_then(|thread_event| match thread_event {
+    ThreadBlocked { cause } => state
+      .last_execution
+      .as_ref()
+      .and_then(|e| match e.event {
         ThreadEvent::JobAssigned(job) => Some(job),
         _ => None,
       })
-      .and_then(|job| unsafe { (*job).on_blocking() }),
+      .and_then(|job| unsafe { (*job).on_blocking(state, cause) }),
     ThreadReady {
       ums_thread_context,
       cause: ThreadReadyCause::Yield { param },
     } => {
-      let thread_state = unsafe { &*(param as *mut ThreadState) };
-      debug_assert_eq!(ums_thread_context, thread_state.ums_thread_context);
-      None
+      let event_slot = unsafe { &*(param as *mut Cell<ThreadEvent>) };
+      let event = event_slot.get();
+      match event {
+        ThreadEvent::Startup => {
+          state
+            .idle_threads
+            .push_back(Executor::new(ums_thread_context, event_slot));
+          None
+        }
+        ThreadEvent::ScheduleJob(job) => {
+          state.queued_jobs.push_back(job);
+          unsafe { (*job).on_schedule(state, ums_thread_context) }
+        }
+        ThreadEvent::JobFinished(job) => {
+          state
+            .idle_threads
+            .push_back(Executor::new(ums_thread_context, event_slot));
+          unsafe { (*job).on_complete(state) }
+        }
+        _ => unreachable!(),
+      }
     }
     ThreadReady {
       ums_thread_context,
@@ -347,14 +544,31 @@ fn scheduler_entry_impl(
       None
     }
   };
-  state.last_executed_thread.take();
+  state.last_execution.take();
 
-  if let Some(ums_thread_context) = next_thread {
-    return Some(ums_thread_context);
+  if let Some(next_execution) = next_execution {
+    return next_execution.execute(state);
   }
-
+  if !state.queued_jobs.is_empty() && !state.idle_threads.is_empty() {
+    let job = state.queued_jobs.pop_front().unwrap();
+    let executor = state.idle_threads.pop_back().unwrap();
+    let execution = Execution::new(
+      executor.ums_thread_context,
+      executor.event_slot,
+      ThreadEvent::JobAssigned(job),
+    );
+    return execution.execute(state);
+  }
   if state.queued_jobs.is_empty() && state.thread_count_total == 0 {
     return None;
+  }
+
+  let threads_avail = state.idle_threads.len() + state.thread_count_starting;
+  let threads_needed = state.queued_jobs.len() + 1; // Aim to always have a spare thread.
+  let threads_short = threads_needed.saturating_sub(threads_avail);
+  for _ in 0..threads_short {
+    create_ums_thread(state.ums_completion_list).unwrap();
+    state.thread_count_starting += 1;
   }
 
   loop {
@@ -388,7 +602,11 @@ fn scheduler_entry_impl(
   }
 }
 
-pub fn run_ums_scheduler() -> io::Result<()> {
+pub fn run_ums_scheduler<F, R>(f: F) -> io::Result<()>
+where
+  F: FnOnce() -> R + Send + 'static,
+  R: 'static,
+{
   unsafe {
     let mut ums_completion_list: *mut UMS_COMPLETION_LIST = null_mut();
     CreateUmsCompletionList(&mut ums_completion_list).result()?;
@@ -397,7 +615,13 @@ pub fn run_ums_scheduler() -> io::Result<()> {
       DeleteUmsCompletionList(l).unwrap();
     });
 
-    let mut scheduler_state = SchedulerState::new(*ums_completion_list);
+    let top_level_job = TopLevelJob::new(f);
+    let queued_jobs = once(&top_level_job)
+      .map(|job| job as &dyn Job)
+      .map(|job| job as *const dyn Job)
+      .collect::<VecDeque<_>>();
+    let mut scheduler_state =
+      SchedulerState::new(*ums_completion_list, queued_jobs);
 
     let mut scheduler_startup_info = UMS_SCHEDULER_STARTUP_INFO {
       UmsVersion: UMS_VERSION,
