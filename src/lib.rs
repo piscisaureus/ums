@@ -100,7 +100,7 @@ where
     &self,
     _scheduler_state: &mut SchedulerState,
   ) -> Option<Execution> {
-    eprintln!("Top level job done.");
+    //,eprintln!("Top level job done.");
     None
   }
 }
@@ -170,11 +170,7 @@ where
     &self,
     _scheduler_state: &mut SchedulerState,
   ) -> Option<Execution> {
-    println!(
-      "Blocking job done. trap# = {}, syscall# = {}",
-      self.counts.get()[0],
-      self.counts.get()[1]
-    );
+    //println!("Blocking job done. trap# = {}, syscall# = {}", self.counts.get()[0], self.counts.get()[1]);
     Some(Execution::new(
       self.invoker,
       &self.event,
@@ -259,7 +255,7 @@ unsafe extern "system" fn thread_main(_: *mut VOID) -> DWORD {
             _ => unreachable!(),
           }
         }
-        println!("Thread stopped");
+        //,println!("Thread stopped");
         return 0;
       }
       _ => unreachable!(),
@@ -327,6 +323,63 @@ impl Execution {
   }
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+struct SchedulerCounters {
+  scheduler_entry_cause_startup: u64,
+  scheduler_entry_cause_blocked_trap: u64,
+  scheduler_entry_cause_blocked_syscall: u64,
+  scheduler_entry_cause_ready_yield: u64,
+  scheduler_entry_cause_ready_busy: u64,
+  scheduler_entry_cause_ready_suspended: u64,
+  scheduler_entry_cause_ready_terminated: u64,
+  scheduler_entry_cause_ready_execute_failed: u64,
+}
+
+impl SchedulerCounters {
+  #[inline(always)]
+  pub fn add_scheduler_entry_cause(&mut self, cause: &SchedulerEntryCause) {
+    use SchedulerEntryCause::*;
+    use ThreadBlockedCause::*;
+    use ThreadReadyCause::*;
+    match cause {
+      Startup { .. } => {
+        self.scheduler_entry_cause_startup += 1;
+      }
+      ThreadBlocked { cause: Trap, .. } => {
+        self.scheduler_entry_cause_blocked_trap += 1;
+      }
+      ThreadBlocked { cause: SysCall, .. } => {
+        self.scheduler_entry_cause_blocked_syscall += 1;
+      }
+      ThreadReady {
+        cause: Yield { .. },
+        ..
+      } => {
+        self.scheduler_entry_cause_ready_yield += 1;
+      }
+      ThreadReady { cause: Busy, .. } => {
+        self.scheduler_entry_cause_ready_busy += 1;
+      }
+      ThreadReady {
+        cause: Suspended, ..
+      } => {
+        self.scheduler_entry_cause_ready_suspended += 1;
+      }
+      ThreadReady {
+        cause: Terminated, ..
+      } => {
+        self.scheduler_entry_cause_ready_terminated += 1;
+      }
+      ThreadReady {
+        cause: ExecuteFailed { .. },
+        ..
+      } => {
+        self.scheduler_entry_cause_ready_execute_failed += 1;
+      }
+    }
+  }
+}
+
 struct SchedulerState {
   pub queued_jobs: VecDeque<*const dyn Job>,
   pub total_job_count: usize,
@@ -336,6 +389,7 @@ struct SchedulerState {
   pub thread_count_total: usize,
   pub last_execution: Option<Execution>,
   pub ums_completion_list: *mut UMS_COMPLETION_LIST,
+  pub counters: SchedulerCounters,
 }
 
 unsafe impl Send for SchedulerState {}
@@ -356,6 +410,7 @@ impl SchedulerState {
       thread_count_total: 0,
       last_execution: None,
       ums_completion_list,
+      counters: Default::default(),
     }
   }
 }
@@ -492,8 +547,6 @@ fn scheduler_entry_impl(
 ) -> Option<*mut UMS_CONTEXT> {
   use SchedulerEntryCause::*;
 
-  eprintln!("S: {:?}", cause);
-
   let state = unsafe {
     GetCurrentUmsThread()
       .result()
@@ -508,6 +561,8 @@ fn scheduler_entry_impl(
       .map(|state| &mut *state)
       .unwrap()
   };
+
+  state.counters.add_scheduler_entry_cause(&cause);
 
   let next_execution = match cause {
     Startup { .. } => None,
@@ -610,22 +665,17 @@ fn scheduler_entry_impl(
       return None;
     }
   }
-  eprintln!(
-    "#### {:?} {:?} {:?}",
-    state.idle_threads.len(),
-    state.thread_count_total,
-    state.total_job_count,
-  );
+  //,eprintln!("#### {:?} {:?} {:?}", state.idle_threads.len(), state.thread_count_total, state.total_job_count,);
 
   loop {
-    eprintln!("selecting. ready# = {}", state.runnable_threads.len());
+    //,eprintln!("selecting. ready# = {}", state.runnable_threads.len());
     match state.runnable_threads.pop_front() {
       Some(ums_thread_context) => {
-        eprintln!("scheduling: {:X?}", ums_thread_context);
+        //,eprintln!("scheduling: {:X?}", ums_thread_context);
         break Some(ums_thread_context);
       }
       None => {
-        eprintln!("waiting for ready threads");
+        //,eprintln!("waiting for ready threads");
         let mut ums_thread_context_list_head: *mut UMS_CONTEXT = null_mut();
         unsafe {
           DequeueUmsCompletionListItems(
@@ -636,7 +686,7 @@ fn scheduler_entry_impl(
         }
         .unwrap();
         while !(ums_thread_context_list_head.is_null()) {
-          eprintln!("w<r");
+          //,eprintln!("w<r");
           state
             .runnable_threads
             .push_back(ums_thread_context_list_head);
@@ -675,7 +725,11 @@ where
       SchedulerProc: Some(scheduler_entry),
       SchedulerParam: &mut scheduler_state as *mut _ as *mut VOID,
     };
-    EnterUmsSchedulingMode(&mut scheduler_startup_info).result()
+    let result = EnterUmsSchedulingMode(&mut scheduler_startup_info).result();
+
+    println!("{:#?}", &scheduler_state.counters);
+
+    result
   }
 }
 

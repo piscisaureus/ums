@@ -9,3 +9,6 @@ winapi = { version = "0.3.8", features = ['everything'] }
 scopeguard = "1.1.0"
 derive_deref = "1.1.0"
 ntapi = "0.3.4"
+
+[features]
+ums = []
