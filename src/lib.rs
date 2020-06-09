@@ -13,18 +13,15 @@ use scopeguard::ScopeGuard;
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::convert::TryInto;
 use std::fmt::Debug;
-
 use std::io;
 use std::iter::once;
 use std::iter::repeat;
 use std::mem::align_of;
-
 use std::mem::size_of;
 use std::mem::size_of_val;
-
 use std::mem::MaybeUninit;
-
 use std::ptr::null_mut;
 
 use winapi::shared::basetsd::*;
@@ -316,6 +313,10 @@ impl Execution {
     self,
     scheduler_state: &mut SchedulerState,
   ) -> Option<*mut UMS_CONTEXT> {
+    scheduler_state
+      .thread_affinity
+      .bind_to_current_cpu()
+      .unwrap();
     let ums_thread_context = self.ums_thread_context;
     unsafe { &*self.event_slot }.set(self.event);
     scheduler_state.last_execution = Some(self);
@@ -380,6 +381,70 @@ impl SchedulerCounters {
   }
 }
 
+enum ThreadAffinity {
+  Unbound,
+  CpuBound {
+    cpu_num: BYTE,
+    original_mask: DWORD_PTR,
+  },
+}
+
+impl Default for ThreadAffinity {
+  fn default() -> Self {
+    Self::Unbound
+  }
+}
+
+impl ThreadAffinity {
+  #[inline(always)]
+  fn set_current_thread_affinity_mask(
+    new_mask: DWORD_PTR,
+  ) -> io::Result<DWORD_PTR> {
+    let r = unsafe { SetThreadAffinityMask(GetCurrentThread(), new_mask) };
+    match r {
+      0 => Err(io::Error::get_last_error()),
+      original_mask => Ok(original_mask),
+    }
+  }
+
+  pub fn unbind(&mut self) -> io::Result<()> {
+    match self {
+      Self::Unbound => {}
+      Self::CpuBound { original_mask, .. } => {
+        Self::set_current_thread_affinity_mask(*original_mask)?;
+        *self = Self::Unbound;
+      }
+    }
+    Ok(())
+  }
+
+  pub fn bind_to_cpu(&mut self, new_cpu_num: BYTE) -> io::Result<()> {
+    assert!(new_cpu_num < MAXIMUM_PROCESSORS);
+    let new_mask: DWORD_PTR = 1 << new_cpu_num;
+
+    match self {
+      Self::Unbound => {
+        let original_mask = Self::set_current_thread_affinity_mask(new_mask)?;
+        *self = Self::CpuBound {
+          cpu_num: new_cpu_num,
+          original_mask,
+        };
+      }
+      Self::CpuBound { cpu_num, .. } if *cpu_num == new_cpu_num => {}
+      Self::CpuBound { cpu_num, .. } => {
+        Self::set_current_thread_affinity_mask(new_mask)?;
+        *cpu_num = new_cpu_num;
+      }
+    };
+    Ok(())
+  }
+
+  pub fn bind_to_current_cpu(&mut self) -> io::Result<()> {
+    let cpu_num = unsafe { GetCurrentProcessorNumber() }.try_into().unwrap();
+    self.bind_to_cpu(cpu_num)
+  }
+}
+
 struct SchedulerState {
   pub queued_jobs: VecDeque<*const dyn Job>,
   pub total_job_count: usize,
@@ -389,6 +454,7 @@ struct SchedulerState {
   pub thread_count_total: usize,
   pub last_execution: Option<Execution>,
   pub ums_completion_list: *mut UMS_COMPLETION_LIST,
+  pub thread_affinity: ThreadAffinity,
   pub counters: SchedulerCounters,
 }
 
@@ -410,6 +476,7 @@ impl SchedulerState {
       thread_count_total: 0,
       last_execution: None,
       ums_completion_list,
+      thread_affinity: Default::default(),
       counters: Default::default(),
     }
   }
@@ -627,8 +694,11 @@ fn scheduler_entry_impl(
   if let Some(next_execution) = next_execution {
     return next_execution.execute(state);
   }
+
   if !state.queued_jobs.is_empty() && !state.idle_threads.is_empty() {
     let job = state.queued_jobs.pop_front().unwrap();
+    // Use idle_threads.pop_back() because we it's more efficient to execute on
+    // a recently-run stack over one that hasn't seen action for a while.
     let executor = state.idle_threads.pop_back().unwrap();
     let execution = Execution::new(
       executor.ums_thread_context,
@@ -662,39 +732,52 @@ fn scheduler_entry_impl(
     }
     if state.thread_count_total == 0 {
       assert!(state.thread_count_starting == 0);
+      state.thread_affinity.unbind().unwrap();
       return None;
     }
   }
-  //,eprintln!("#### {:?} {:?} {:?}", state.idle_threads.len(), state.thread_count_total, state.total_job_count,);
 
   loop {
-    //,eprintln!("selecting. ready# = {}", state.runnable_threads.len());
     match state.runnable_threads.pop_front() {
       Some(ums_thread_context) => {
-        //,eprintln!("scheduling: {:X?}", ums_thread_context);
+        state.thread_affinity.bind_to_current_cpu().unwrap();
         break Some(ums_thread_context);
       }
       None => {
-        //,eprintln!("waiting for ready threads");
-        let mut ums_thread_context_list_head: *mut UMS_CONTEXT = null_mut();
-        unsafe {
-          DequeueUmsCompletionListItems(
-            state.ums_completion_list,
-            INFINITE,
-            &mut ums_thread_context_list_head,
-          )
-        }
-        .unwrap();
-        while !(ums_thread_context_list_head.is_null()) {
-          //,eprintln!("w<r");
-          state
-            .runnable_threads
-            .push_back(ums_thread_context_list_head);
-          ums_thread_context_list_head =
-            unsafe { GetNextUmsListItem(ums_thread_context_list_head) };
-        }
+        state.thread_affinity.unbind().unwrap();
+        poll_ums_completion_list(state, None).unwrap();
       }
     }
+  }
+}
+
+fn poll_ums_completion_list(
+  state: &mut SchedulerState,
+  timeout: Option<DWORD>,
+) -> Result<bool, io::Error> {
+  let timeout_dword = timeout.unwrap_or(INFINITE);
+  let mut ums_thread_context_list_head: *mut UMS_CONTEXT = null_mut();
+  let r = unsafe {
+    DequeueUmsCompletionListItems(
+      state.ums_completion_list,
+      timeout_dword,
+      &mut ums_thread_context_list_head,
+    )
+  }
+  .ok_or_else(DWORD::get_last_error);
+  match r {
+    Ok(_) => {
+      while !(ums_thread_context_list_head.is_null()) {
+        state
+          .runnable_threads
+          .push_back(ums_thread_context_list_head);
+        ums_thread_context_list_head =
+          unsafe { GetNextUmsListItem(ums_thread_context_list_head) };
+      }
+      Ok(true)
+    }
+    Err(ERROR_TIMEOUT) if timeout.is_some() => Ok(false),
+    Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
   }
 }
 
@@ -784,6 +867,7 @@ fn create_ums_thread(
       null_mut(),
     )
     .result()?;
+
     CloseHandle(thread_handle).result()?;
 
     Ok(ScopeGuard::into_inner(ums_thread_context))
