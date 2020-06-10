@@ -1,35 +1,90 @@
+#![allow(unused_imports)]
+
+use std::cell::UnsafeCell;
+use std::fs::read_dir;
+use std::fs::ReadDir;
+use std::iter::Iterator;
+use std::mem::drop;
+use std::ptr::NonNull;
+
 use ums::*;
-#[allow(unused_imports)]
 use winapi::um::handleapi::*;
 use winapi::um::sysinfoapi::*;
 
 static mut CTR: u64 = 0;
 
+fn iter_subdirs(iter: ReadDir) -> impl Iterator<Item = ReadDir> {
+  iter
+    .filter_map(|e| e.ok())
+    .filter(|e| {
+      e.metadata()
+        .map(|m| m.file_type())
+        .map(|ft| ft.is_dir() && !ft.is_symlink())
+        .unwrap_or(false)
+    })
+    .map(|e| e.path())
+    .filter_map(|p| read_dir(&p).ok())
+}
+
+struct Stack<T>(NonNull<Vec<T>>);
+impl<T> Default for Stack<T> {
+  fn default() -> Self {
+    Self(NonNull::new(Box::into_raw(Box::new(Vec::new()))).unwrap())
+  }
+}
+
+impl<T> Copy for Stack<T> {}
+
+impl<T> Clone for Stack<T> {
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+unsafe impl<T> Send for Stack<T> {}
+unsafe impl<T> Sync for Stack<T> {}
+
+impl<T> Stack<T> {
+  pub unsafe fn get(&mut self) -> &mut Vec<T> {
+    &mut *self.0.as_mut()
+  }
+}
+
 fn main() {
+  let dir_stack = Stack::default();
   loop {
-    run_ums_scheduler(|| {
+    run_ums_scheduler(move || {
       for i in 0..10 {
         unsafe { CTR = 0 };
         let use_ums = i & 1 == 0;
         let mut d = unsafe { GetTickCount64() };
-        for _ in 0..100_000 {
+        for _ in 0..20_000 {
           unsafe { CTR += 1 };
-          let f = || {
-            //unsafe { CloseHandle(INVALID_HANDLE_VALUE) };
-            std::fs::metadata("\\").unwrap();
-            //std::env::var("Path").unwrap();
-            //let _ = std::fs::File::open("d:\\ums\\stat.js");
-            //std::process::Command::new("cmd.exe")
-            //  .arg("/c")
-            //  .arg("echo")
-            //  .arg("Hoi!")
-            //  .output()
-            //  .unwrap();
+          let f = move |mut dir_stack: Stack<_>| {
+            let dir_stack = unsafe { dir_stack.get() };
+            loop {
+              match dir_stack.last_mut() {
+                None => {
+                  let root_iter = read_dir("r:\\").map(iter_subdirs).unwrap();
+                  dir_stack.push(root_iter);
+                  continue;
+                }
+                Some(dir_iter) => {
+                  if let Some(rd) = dir_iter.next() {
+                    let subdir_iter = iter_subdirs(rd);
+                    dir_stack.push(subdir_iter);
+                    return;
+                  }
+                }
+              };
+              dir_stack.pop();
+            }
           };
           if use_ums {
-            blocking(f);
+            let dir_stack = dir_stack;
+            blocking(move || f(dir_stack));
           } else {
-            f();
+            f(dir_stack);
           }
         }
         d = unsafe { GetTickCount64() } - d;
